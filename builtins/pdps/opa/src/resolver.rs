@@ -310,10 +310,12 @@ impl OpaResolver {
             .add_policy(INLINE_MODULE_NAME.to_owned(), src.to_owned())
             .map_err(|e| EngineError::Compile(e.to_string()))?;
 
-        // Reject an inline module that lands in a global module's package — it
-        // would merge into (and could override) operator policy. Fail-closed:
-        // inline modules may add new packages, never redefine a global one.
-        if self.global_packages.contains(&package) {
+        // Inline modules may add packages but may not share a global package subtree.
+        if self
+            .global_packages
+            .iter()
+            .any(|g| packages_share_subtree(&package, g))
+        {
             return Err(EngineError::PackageCollision(package));
         }
 
@@ -383,6 +385,15 @@ impl OpaResolver {
             diagnostics: vec![cause],
         }
     }
+}
+
+/// Whether two dotted Rego package paths are equal or one contains the other.
+/// Path-separator boundaries keep siblings such as `data.authz` and
+/// `data.authznext` distinct.
+fn packages_share_subtree(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('.'))
+        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// Internal — failure shapes from preparing a per-step engine. All three
@@ -965,6 +976,23 @@ msg := "not a decision"
         }
     }
 
+    #[tokio::test]
+    async fn inline_module_cannot_override_global_subpackage() {
+        let global = "package authz\ndefault allow := false\nallow if data.authz.exceptions[input.subject.id]\n";
+        let r = resolver(&[global], OnError::Allow);
+        let inline = "package authz.exceptions\nexceptions := {\"eve\": true}\n";
+        let out = r
+            .evaluate(&call("data.authz.allow", Some(inline)), &bag("eve"))
+            .await
+            .unwrap();
+        match out.decision {
+            Decision::Deny { reason, .. } => {
+                assert!(reason.unwrap_or_default().contains("collides"));
+            },
+            other => panic!("sub-package collision must deny, got {other:?}"),
+        }
+    }
+
     /// An inline module in a fresh package (no global collision) is accepted and
     /// evaluates — inline modules remain a usable feature for additive policy.
     #[tokio::test]
@@ -976,6 +1004,39 @@ msg := "not a decision"
             .await
             .unwrap();
         assert_eq!(out.decision, Decision::Allow);
+    }
+
+    #[tokio::test]
+    async fn inline_module_in_prefix_sibling_package_is_allowed() {
+        let global = "package authz\nallow if input.subject.id == \"alice\"\n";
+        let r = resolver(&[global], OnError::Deny);
+        let inline = "package authznext\nallow if input.subject.id == \"alice\"\n";
+        let out = r
+            .evaluate(&call("data.authznext.allow", Some(inline)), &bag("alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.decision,
+            Decision::Allow,
+            "a prefix-sibling package must not collide with a global package"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_module_that_is_parent_of_global_collides() {
+        let global = "package authz.sub\nallow if input.subject.id == \"alice\"\n";
+        let r = resolver(&[global], OnError::Allow);
+        let inline = "package authz\nallow := true\n";
+        let out = r
+            .evaluate(&call("data.authz.allow", Some(inline)), &bag("alice"))
+            .await
+            .unwrap();
+        match out.decision {
+            Decision::Deny { reason, .. } => {
+                assert!(reason.unwrap_or_default().contains("collides"));
+            },
+            other => panic!("parent-package collision must deny, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -25,6 +25,11 @@ use bytes::Bytes;
 use praxis_policy::HyperTransport;
 use praxis_policy_core::http::{HttpRequest, HttpTransport as _, HttpTransportError};
 
+/// Mockito binds loopback, which the default egress table refuses.
+fn local_transport() -> HyperTransport {
+    HyperTransport::new().with_allow_private_destinations()
+}
+
 #[tokio::test]
 async fn a_plain_http_get_round_trips() {
     // `https_or_http`, not `https_only`: identity-jwt exposes an explicit
@@ -40,7 +45,7 @@ async fn a_plain_http_get_round_trips() {
         .create_async()
         .await;
 
-    let t = HyperTransport::new();
+    let t = local_transport();
     let resp = t
         .execute(HttpRequest::get(format!("{}/jwks", server.url())))
         .await
@@ -79,10 +84,7 @@ async fn request_headers_and_a_post_body_reach_the_server() {
     .header("authorization", "Basic abc")
     .expect("legal header");
 
-    let resp = HyperTransport::new()
-        .execute(req)
-        .await
-        .expect("mock answers");
+    let resp = local_transport().execute(req).await.expect("mock answers");
     m.assert_async().await;
     assert_eq!(resp.status, 200);
 }
@@ -100,7 +102,7 @@ async fn a_non_2xx_status_is_a_response_not_an_error() {
         .create_async()
         .await;
 
-    let resp = HyperTransport::new()
+    let resp = local_transport()
         .execute(HttpRequest::get(format!("{}/missing", server.url())))
         .await
         .expect("a 404 is still a response");
@@ -125,10 +127,7 @@ async fn a_304_is_not_a_success_but_is_not_a_failure_either() {
     let req = HttpRequest::get(format!("{}/jwks", server.url()))
         .header("if-none-match", "\"v1\"")
         .expect("legal header");
-    let resp = HyperTransport::new()
-        .execute(req)
-        .await
-        .expect("mock answers");
+    let resp = local_transport().execute(req).await.expect("mock answers");
 
     assert!(resp.is_not_modified());
     assert!(!resp.is_success());
@@ -149,7 +148,7 @@ async fn an_oversized_body_is_refused_rather_than_truncated() {
         .await;
 
     let req = HttpRequest::get(format!("{}/big", server.url())).max_response_bytes(128);
-    let err = HyperTransport::new()
+    let err = local_transport()
         .execute(req)
         .await
         .expect_err("4096 bytes exceeds a 128-byte ceiling");
@@ -206,7 +205,7 @@ async fn a_server_that_stalls_mid_body_trips_the_deadline() {
 
     let req = HttpRequest::get(format!("{base}/jwks")).timeout(Duration::from_millis(200));
     let started = std::time::Instant::now();
-    let err = HyperTransport::new()
+    let err = local_transport()
         .execute(req)
         .await
         .expect_err("the server never finishes the body");
@@ -237,7 +236,7 @@ async fn one_transport_serves_many_requests_from_one_pool() {
         .create_async()
         .await;
 
-    let t = HyperTransport::new();
+    let t = local_transport();
     for _ in 0..3 {
         let resp = t
             .execute(HttpRequest::get(format!("{}/jwks", server.url())))
@@ -280,7 +279,7 @@ async fn a_transport_built_on_a_dropped_runtime_still_works() {
             .enable_all()
             .build()
             .expect("init runtime");
-        rt.block_on(async { HyperTransport::new() })
+        rt.block_on(async { local_transport() })
         // `rt` drops here.
     })
     .join()

@@ -3,8 +3,17 @@
 
 // APL evaluator — walks the IR against an AttributeBag and returns a Decision.
 //
-// The evaluator is sync and infallible by design. Missing attributes resolve
-// to `false`; operator type mismatches resolve to `false`.
+// The evaluator is sync. Missing attributes resolve to `false` for
+// presence, equality, membership, and order; operator type mismatches on
+// equality and membership resolve to `false`. `!=` is the exception: an
+// absent key is not equal to a concrete value, so `NotEq` is true,
+// matching `!(x == y)`. A deny rule written as `subject.role != "admin"`
+// therefore fires when the role is missing rather than falling through
+// to Allow.
+//
+// Order comparison on a *present* value that is not a finite number is
+// not a boolean. `false` skips a deny rule; `true` inverts under `!`.
+// The phase Denies instead, with a reason that says fail-closed.
 // The host drives the four phases separately by calling `evaluate_rules` once
 // per declared phase — phase orchestration lives in `praxis-policy-apl-runtime`.
 //
@@ -50,8 +59,18 @@ pub enum Decision {
 /// pick the right entry point for the effects in the rules.
 pub fn evaluate_rules(rules: &[Rule], bag: &AttributeBag) -> Decision {
     for rule in rules {
-        if !eval_expression(&rule.condition, bag) {
-            continue;
+        match eval_expression(&rule.condition, bag) {
+            Ok(false) => continue,
+            // The condition could not be evaluated. Skipping the rule
+            // would fall through to Allow; firing it as `true` would
+            // invert under `!`. Deny the phase.
+            Err(err) => {
+                return Decision::Deny {
+                    reason: Some(err.reason()),
+                    rule_source: rule.source.clone(),
+                };
+            },
+            Ok(true) => {},
         }
         for effect in &rule.effects {
             match effect {
@@ -75,37 +94,53 @@ pub fn evaluate_rules(rules: &[Rule], bag: &AttributeBag) -> Decision {
     Decision::Allow
 }
 
-fn eval_expression(expr: &Expression, bag: &AttributeBag) -> bool {
+fn eval_expression(expr: &Expression, bag: &AttributeBag) -> Result<bool, Unorderable> {
     match expr {
         Expression::Condition(c) => eval_condition(c, bag),
-        Expression::And(parts) => parts.iter().all(|e| eval_expression(e, bag)),
-        Expression::Or(parts) => parts.iter().any(|e| eval_expression(e, bag)),
-        Expression::Not(inner) => !eval_expression(inner, bag),
-        Expression::Always => true,
+        Expression::And(parts) => {
+            for e in parts {
+                if !eval_expression(e, bag)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        },
+        Expression::Or(parts) => {
+            for e in parts {
+                if eval_expression(e, bag)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        // `?` keeps Unorderable from inverting into a permit.
+        Expression::Not(inner) => Ok(!eval_expression(inner, bag)?),
+        Expression::Always => Ok(true),
     }
 }
 
-fn eval_condition(cond: &Condition, bag: &AttributeBag) -> bool {
+fn eval_condition(cond: &Condition, bag: &AttributeBag) -> Result<bool, Unorderable> {
     match cond {
         // An unresolvable interpolated path (a missing request value) is
         // treated as an absent key: `IsTrue`/`Exists`/`Comparison` are
         // false, but `IsFalse` is true (absent is falsy — keeps
         // `require(...)` fail-closed when the keyed lookup can't resolve).
-        Condition::IsTrue { key } => bag
+        Condition::IsTrue { key } => Ok(bag
             .resolve_key(key)
             .map(|k| bag.get_bool(&k).unwrap_or(false))
-            .unwrap_or(false),
-        Condition::IsFalse { key } => bag
+            .unwrap_or(false)),
+        Condition::IsFalse { key } => Ok(bag
             .resolve_key(key)
             .map(|k| !bag.get_bool(&k).unwrap_or(false))
-            .unwrap_or(true),
-        Condition::Exists { key } => bag
+            .unwrap_or(true)),
+        Condition::Exists { key } => Ok(bag
             .resolve_key(key)
             .map(|k| bag.contains(&k))
-            .unwrap_or(false),
+            .unwrap_or(false)),
         Condition::Comparison { key, op, value } => match bag.resolve_key(key) {
             Some(k) => eval_comparison(&k, *op, value, bag),
-            None => false,
+            // An unresolvable interpolated path is an absent key.
+            None => Ok(matches!(*op, CompareOp::NotEq)),
         },
         Condition::InSet {
             value_key,
@@ -119,28 +154,66 @@ fn eval_condition(cond: &Condition, bag: &AttributeBag) -> bool {
                 },
                 None => false, // an interpolated key didn't resolve
             };
-            if *negate { !in_set } else { in_set }
+            Ok(if *negate { !in_set } else { in_set })
         },
     }
 }
 
-fn eval_comparison(key: &str, op: CompareOp, lit: &Literal, bag: &AttributeBag) -> bool {
+fn eval_comparison(
+    key: &str,
+    op: CompareOp,
+    lit: &Literal,
+    bag: &AttributeBag,
+) -> Result<bool, Unorderable> {
     let attr = match bag.get(key) {
         Some(v) => v,
-        None => return false, // missing → false
+        // Missing is false for every operator except `!=`. Treating
+        // `NotEq` as false here broke duality with `!(x == y)` and let
+        // `role != "admin": deny` fall through to Allow when `role` was
+        // omitted.
+        None => return Ok(matches!(op, CompareOp::NotEq)),
     };
 
     match op {
-        CompareOp::Contains => match (attr, lit) {
+        CompareOp::Contains => Ok(match (attr, lit) {
             (AttributeValue::StringSet(_), Literal::String(s)) => bag.set_contains(key, s),
             _ => false,
-        },
-        CompareOp::Eq => values_eq(attr, lit),
-        CompareOp::NotEq => !values_eq(attr, lit),
-        CompareOp::Gt => numeric_compare(attr, lit, OrderOp::Gt),
-        CompareOp::GtEq => numeric_compare(attr, lit, OrderOp::GtEq),
-        CompareOp::Lt => numeric_compare(attr, lit, OrderOp::Lt),
-        CompareOp::LtEq => numeric_compare(attr, lit, OrderOp::LtEq),
+        }),
+        CompareOp::Eq => Ok(values_eq(attr, lit)),
+        CompareOp::NotEq => Ok(!values_eq(attr, lit)),
+        CompareOp::Gt => order_compare(key, attr, lit, OrderOp::Gt),
+        CompareOp::GtEq => order_compare(key, attr, lit, OrderOp::GtEq),
+        CompareOp::Lt => order_compare(key, attr, lit, OrderOp::Lt),
+        CompareOp::LtEq => order_compare(key, attr, lit, OrderOp::LtEq),
+    }
+}
+
+fn order_compare(
+    key: &str,
+    attr: &AttributeValue,
+    lit: &Literal,
+    op: OrderOp,
+) -> Result<bool, Unorderable> {
+    numeric_compare(attr, lit, op).map_err(|()| Unorderable {
+        key: key.to_owned(),
+    })
+}
+
+/// An order operator was applied to a value that cannot be ordered
+/// exactly. There is no boolean that is safe to return: `false` skips
+/// a deny rule, `true` inverts under `!`. The phase Denies instead.
+#[derive(Debug)]
+struct Unorderable {
+    key: String,
+}
+
+impl Unorderable {
+    fn reason(&self) -> String {
+        format!(
+            "order comparison on `{}` failed (fail-closed): value is not a finite number, \
+             or an integer that cannot be compared exactly through f64",
+            self.key
+        )
     }
 }
 
@@ -181,41 +254,55 @@ fn values_eq(attr: &AttributeValue, lit: &Literal) -> bool {
     }
 }
 
-fn numeric_compare(attr: &AttributeValue, lit: &Literal, op: OrderOp) -> bool {
+fn numeric_compare(attr: &AttributeValue, lit: &Literal, op: OrderOp) -> Result<bool, ()> {
     // Integer pairs compare exactly, without going through f64 first. Above
     // 2^53 a double cannot represent every i64, so distinct integers collapse
     // onto the same value and an ordering test answers the wrong way. This is
     // the common shape in practice (`args.amount > 10000`), and it is the one
     // where an exact answer is available for free.
     if let (AttributeValue::Int(a), Literal::Int(b)) = (attr, lit) {
-        return match op {
+        return Ok(match op {
             OrderOp::Gt => a > b,
             OrderOp::GtEq => a >= b,
             OrderOp::Lt => a < b,
             OrderOp::LtEq => a <= b,
-        };
+        });
     }
 
     // Every other combination needs a common type, and f64 is it. Numeric-looking
     // strings are coerced — LLM tool arguments routinely arrive as strings
     // (e.g. `"amount": "25000"`), and a policy author writing
-    // `args.amount > 10000` plainly means a numeric comparison. A string
-    // that doesn't parse as a number is genuinely non-numeric → false
-    // (order operators don't apply).
-    let a = match coerce_f64_attr(attr) {
-        Some(a) => a,
-        None => return false,
-    };
-    let b = match coerce_f64_lit(lit) {
-        Some(b) => b,
-        None => return false,
-    };
-    match op {
+    // `args.amount > 10000` plainly means a numeric comparison. A present
+    // value that is not a finite number cannot be ordered: `Err` so the
+    // phase Denies rather than treating the comparison as false.
+    //
+    // Integers whose magnitude exceeds 2^53 are not exact as `f64`.
+    // Coercing them for a mixed int/float compare would collapse distinct
+    // amounts and a max-amount deny could skip. Those pairs are Unorderable
+    // too, same as `NaN`.
+    let a = coerce_f64_attr(attr).ok_or(())?;
+    let b = coerce_f64_lit(lit).ok_or(())?;
+    Ok(match op {
         OrderOp::Gt => a > b,
         OrderOp::GtEq => a >= b,
         OrderOp::Lt => a < b,
         OrderOp::LtEq => a <= b,
-    }
+    })
+}
+
+/// Largest `|n|` for which every integer in `[-n, n]` is a distinct `f64`.
+/// Above this, mixed int/float order would collapse distinct amounts.
+const F64_EXACT_INT_BOUND: i64 = 9_007_199_254_740_992; // 2^53
+
+/// Convert `n` to `f64` only when the conversion is exact.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the bound below is the exact-integer range of f64"
+)]
+fn i64_as_exact_f64(n: i64) -> Option<f64> {
+    (-F64_EXACT_INT_BOUND..=F64_EXACT_INT_BOUND)
+        .contains(&n)
+        .then_some(n as f64)
 }
 
 /// Coerce a bag attribute to `f64` for an order comparison: numbers pass
@@ -223,33 +310,50 @@ fn numeric_compare(attr: &AttributeValue, lit: &Literal, op: OrderOp) -> bool {
 /// else is non-numeric.
 ///
 /// Only reached for operand pairs that are not both integers, since
-/// [`numeric_compare`] answers those exactly before coercing.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "f64 is the only common type for a mixed int/float comparison"
-)]
+/// [`numeric_compare`] answers those exactly before coercing. Integers
+/// outside [`F64_EXACT_INT_BOUND`] return `None` so the compare Denies
+/// rather than rounding.
 fn coerce_f64_attr(attr: &AttributeValue) -> Option<f64> {
     match attr {
-        AttributeValue::Int(a) => Some(*a as f64),
-        AttributeValue::Float(a) => Some(*a),
-        AttributeValue::String(s) => s.trim().parse::<f64>().ok(),
+        AttributeValue::Int(a) => i64_as_exact_f64(*a),
+        AttributeValue::Float(a) => finite_f64(*a),
+        AttributeValue::String(s) => coerce_f64_numeric_string(s),
         _ => None,
     }
 }
 
 /// Coerce a literal to `f64` for an order comparison. Same rules as
 /// [`coerce_f64_attr`] so `args.x > "10"` works symmetrically.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "f64 is the only common type for a mixed int/float comparison"
-)]
 fn coerce_f64_lit(lit: &Literal) -> Option<f64> {
     match lit {
-        Literal::Int(b) => Some(*b as f64),
-        Literal::Float(b) => Some(*b),
-        Literal::String(s) => s.trim().parse::<f64>().ok(),
+        Literal::Int(b) => i64_as_exact_f64(*b),
+        Literal::Float(b) => finite_f64(*b),
+        Literal::String(s) => coerce_f64_numeric_string(s),
         _ => None,
     }
+}
+
+/// Parse a numeric-looking string for order comparison.
+///
+/// Integer spellings go through [`i64_as_exact_f64`]. `parse::<f64>()`
+/// rounds `"9007199254740993"` onto 2^53, which is the same collapse the
+/// `Int` arm refuses — LLM tool arguments arrive as strings, so that is
+/// the operand shape the bound was written for. Fractional strings still
+/// parse as `f64`.
+fn coerce_f64_numeric_string(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<i64>() {
+        return i64_as_exact_f64(n);
+    }
+    s.parse::<f64>().ok().and_then(finite_f64)
+}
+
+/// `f64::from_str` accepts `NaN`, `inf`, and `-inf`. IEEE order is not
+/// a boolean we can return: `NaN > 10000` and `-inf > 10000` are false
+/// (a max-amount deny would skip), `inf > 10000` is true. Non-finite
+/// and non-numeric both fail the coerce so the phase Denies.
+fn finite_f64(f: f64) -> Option<f64> {
+    f.is_finite().then_some(f)
 }
 
 /// Heuristic: does `s` look like a bag attribute reference (e.g.
@@ -684,8 +788,17 @@ async fn dispatch_effect(
             // Predicate-gated body — replaces the historical
             // `Step::Rule`. Skip silently when the condition is false;
             // otherwise walk the body in order and halt on first Deny.
-            if !eval_expression(condition, bag) {
-                return EffectOutcome::Continue;
+            // An unorderable condition Denies: skipping would drop a
+            // gate that never finished evaluating.
+            match eval_expression(condition, bag) {
+                Ok(false) => return EffectOutcome::Continue,
+                Err(err) => {
+                    return EffectOutcome::Halt(Decision::Deny {
+                        reason: Some(err.reason()),
+                        rule_source: source.clone(),
+                    });
+                },
+                Ok(true) => {},
             }
             for inner in body {
                 match Box::pin(dispatch_effect(
@@ -942,10 +1055,12 @@ async fn dispatch_elicitation(
             // bind args — no RFC 9396 RAR.
             if let Some(scope_src) = &step.scope {
                 match crate::parser::parse_predicate(scope_src) {
-                    Ok(expr) => {
-                        if !eval_expression(&expr, bag) {
+                    Ok(expr) => match eval_expression(&expr, bag) {
+                        Ok(true) => {},
+                        Ok(false) => {
                             return fail(format!("elicitation scope not satisfied: `{scope_src}`"));
-                        }
+                        },
+                        Err(err) => return fail(err.reason()),
                     },
                     Err(e) => {
                         return fail(format!(
@@ -1093,11 +1208,11 @@ fn dispatch_parallel<'a>(
 
         // Aggregate in input order: append every branch's taints; pick
         // the first Halt (by branch index, not wall-clock order) as the
-        // overall result. Aborted / panicked branches contribute no
-        // taints — they didn't run to completion. A panicked branch is
-        // *not* converted into a Halt; we log via `tracing::warn!` and
-        // continue. (A misbehaving plugin shouldn't take down the
-        // parallel block any more than it would the host process.)
+        // overall result. Aborted branches contribute no taints — they
+        // were cancelled because a sibling already denied. A panicked
+        // or timed-out branch is a Halt: dropping it would let a
+        // sibling Allow stand in for a gate that never finished, which
+        // is the same fail-open shape as pairing a Deny with Aborted.
         let mut first_halt: Option<Decision> = None;
         for (idx, outcome) in outcomes.into_iter().enumerate() {
             match outcome {
@@ -1120,18 +1235,33 @@ fn dispatch_parallel<'a>(
                 },
                 BranchOutcome::TimedOut => {
                     // Unreachable today (no per-branch timeout
-                    // configured). Treat as a no-op if it ever fires
-                    // post-config-extension.
+                    // configured). Fail closed if it ever fires: a
+                    // gate that did not finish cannot become Allow.
+                    if first_halt.is_none() {
+                        let label = effects
+                            .get(idx)
+                            .map_or_else(|| "unknown".to_owned(), parallel_branch_label);
+                        first_halt = Some(Decision::Deny {
+                            reason: Some(format!(
+                                "parallel branch {idx} ({label}) timed out (fail-closed)"
+                            )),
+                            rule_source: fallback_source.to_owned(),
+                        });
+                    }
                 },
                 BranchOutcome::Panicked(msg) => {
-                    // A panicking branch is a misbehaving plugin/effect;
-                    // dropping its output (no Halt, no taints) keeps the
-                    // parallel block's other branches intact rather than
-                    // taking the whole block down. praxis-policy-apl-core has no
-                    // tracing dep — host integrations that care can
-                    // surface the panic via praxis-policy-core's plugin error
-                    // path. `idx`/`msg` are eaten here.
-                    let _ = (idx, msg);
+                    // Use the panic as this branch's synthetic Halt and audit reason.
+                    if first_halt.is_none() {
+                        let label = effects
+                            .get(idx)
+                            .map_or_else(|| "unknown".to_owned(), parallel_branch_label);
+                        first_halt = Some(Decision::Deny {
+                            reason: Some(format!(
+                                "parallel branch {idx} ({label}) panicked (fail-closed): {msg}"
+                            )),
+                            rule_source: "parallel.branch_panic".to_owned(),
+                        });
+                    }
                 },
             }
         }
@@ -1141,6 +1271,24 @@ fn dispatch_parallel<'a>(
             None => EffectOutcome::Continue,
         }
     })
+}
+
+/// Short identity for a parallel branch in fail-closed deny reasons.
+fn parallel_branch_label(effect: &Effect) -> String {
+    match effect {
+        Effect::Allow => "allow".to_owned(),
+        Effect::Deny { .. } => "deny".to_owned(),
+        Effect::Plugin { name } => format!("plugin({name})"),
+        Effect::Delegate(_) => "delegate".to_owned(),
+        Effect::Elicit(_) => "elicit".to_owned(),
+        Effect::Taint { label, .. } => format!("taint({label})"),
+        Effect::Restrict { .. } => "restrict".to_owned(),
+        Effect::FieldOp { path, .. } => format!("field_op({path})"),
+        Effect::Sequential(_) => "sequential".to_owned(),
+        Effect::Parallel(_) => "parallel".to_owned(),
+        Effect::When { source, .. } => format!("when({source})"),
+        Effect::Pdp { call, .. } => format!("pdp({:?})", call.dialect),
+    }
 }
 
 /// Apply a `FieldOp` effect — resolve the path in args/result, run
@@ -1175,6 +1323,7 @@ async fn dispatch_field_op(
 
     // Pick the right side of the payload based on the path prefix.
     // Out-of-phase ops drop silently (see the doc comment).
+    #[derive(Clone, Copy)]
     enum Side {
         Args,
         Result,
@@ -1201,43 +1350,52 @@ async fn dispatch_field_op(
         });
     };
 
-    let Some(current) = get_dotted(root, subpath).cloned() else {
-        return EffectOutcome::Continue; // missing field → silent no-op
+    // Expand intermediate arrays; excessive fan-out fails closed.
+    let Some(paths) = crate::route::expand_field_paths(root, subpath) else {
+        return EffectOutcome::Halt(Decision::Deny {
+            reason: Some(format!(
+                "FieldOp path `{path}` expands to too many elements to redact safely"
+            )),
+            rule_source: fallback_source.to_owned(),
+        });
     };
 
     let pipeline = crate::pipeline::Pipeline {
         stages: stages.to_vec(),
     };
-    // `subpath`, not `path`: the field name a pipeline reports to a
-    // plugin is relative to the args / result root, matching what the
-    // `args:` / `result:` section pipelines pass. The prefixed `path`
-    // stays in use for deny messages, where the reader wants the side
-    // spelled out.
-    let eval = evaluate_pipeline(&pipeline, &current, bag, plugins, subpath, phase).await;
-    taints.extend(eval.taints);
     let mark_modified = |side: Side, args: &mut bool, result: &mut bool| match side {
         Side::Args => *args = true,
         Side::Result => *result = true,
     };
-    match eval.outcome {
-        FieldOutcome::Pass => EffectOutcome::Continue,
-        FieldOutcome::Replace(new_val) => {
-            if set_dotted(root, subpath, new_val) {
-                mark_modified(side, args_modified, result_modified);
-            }
-            EffectOutcome::Continue
-        },
-        FieldOutcome::Omit => {
-            if remove_dotted(root, subpath) {
-                mark_modified(side, args_modified, result_modified);
-            }
-            EffectOutcome::Continue
-        },
-        FieldOutcome::Deny { reason, .. } => EffectOutcome::Halt(Decision::Deny {
-            reason: Some(reason),
-            rule_source: fallback_source.to_owned(),
-        }),
+    for concrete in paths {
+        let Some(current) = get_dotted(root, &concrete).cloned() else {
+            continue; // missing field on this element → silent no-op
+        };
+        // Plugins receive a root-relative field name; deny messages use the
+        // prefixed path to identify the args or result side.
+        let eval = evaluate_pipeline(&pipeline, &current, bag, plugins, subpath, phase).await;
+        taints.extend(eval.taints);
+        match eval.outcome {
+            FieldOutcome::Pass => {},
+            FieldOutcome::Replace(new_val) => {
+                if set_dotted(root, &concrete, new_val) {
+                    mark_modified(side, args_modified, result_modified);
+                }
+            },
+            FieldOutcome::Omit => {
+                if remove_dotted(root, &concrete) {
+                    mark_modified(side, args_modified, result_modified);
+                }
+            },
+            FieldOutcome::Deny { reason, .. } => {
+                return EffectOutcome::Halt(Decision::Deny {
+                    reason: Some(reason),
+                    rule_source: fallback_source.to_owned(),
+                });
+            },
+        }
     }
+    EffectOutcome::Continue
 }
 
 /// Result of running a pipeline against one field's value.
@@ -1469,7 +1627,18 @@ pub async fn evaluate_pipeline(
             Stage::Redact { condition } => {
                 let should_redact = match condition {
                     None => true,
-                    Some(expr) => eval_expression(expr, bag),
+                    Some(expr) => match eval_expression(expr, bag) {
+                        Ok(b) => b,
+                        Err(err) => {
+                            return PipelineEvaluation {
+                                outcome: FieldOutcome::Deny {
+                                    reason: err.reason(),
+                                    stage_index: idx,
+                                },
+                                taints,
+                            };
+                        },
+                    },
                 };
                 if should_redact {
                     current = serde_json::Value::String("[REDACTED]".into());
@@ -1653,6 +1822,20 @@ mod tests {
     use crate::step::{DelegationInvoker, NoopDelegationInvoker};
     use std::collections::HashSet;
 
+    // Production `eval_*` return `Result` so an unorderable amount can
+    // Deny the phase. Tests that are not probing that path unwrap.
+    fn eval_condition(cond: &Condition, bag: &AttributeBag) -> bool {
+        super::eval_condition(cond, bag).expect("test condition is orderable")
+    }
+
+    fn eval_expression(expr: &Expression, bag: &AttributeBag) -> bool {
+        super::eval_expression(expr, bag).expect("test expression is orderable")
+    }
+
+    fn eval_comparison(key: &str, op: CompareOp, lit: &Literal, bag: &AttributeBag) -> bool {
+        super::eval_comparison(key, op, lit, bag).expect("test comparison is orderable")
+    }
+
     fn rule(condition: Expression, effect: Effect, source: &str) -> Rule {
         Rule::single(condition, effect, source)
     }
@@ -1724,6 +1907,88 @@ mod tests {
                 &bag
             ),
             "2^53+1 must compare greater-or-equal to 2^53"
+        );
+    }
+
+    /// Mixed int/float order above 2^53 cannot go through `f64` without
+    /// collapsing distinct amounts. Fail closed rather than answer wrong.
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::float_cmp,
+        reason = "the lossy conversion is the premise under test"
+    )]
+    fn mixed_int_float_order_on_large_integers_is_fail_closed() {
+        let big = 9_007_199_254_740_993_i64; // 2^53 + 1
+        let boundary = 9_007_199_254_740_992_i64; // 2^53
+        assert_eq!(
+            big as f64, boundary as f64,
+            "premise: these are indistinguishable as doubles"
+        );
+
+        let mut bag = AttributeBag::default();
+        bag.set("args.amount", AttributeValue::Int(big));
+        let err = super::eval_comparison(
+            "args.amount",
+            CompareOp::Gt,
+            &Literal::Float(boundary as f64),
+            &bag,
+        )
+        .expect_err("mixed order past 2^53 must not become a boolean");
+        assert!(
+            err.reason().contains("fail-closed"),
+            "reason must say fail-closed: {}",
+            err.reason()
+        );
+
+        bag.set("args.amount", AttributeValue::Float(boundary as f64));
+        let err = super::eval_comparison("args.amount", CompareOp::Lt, &Literal::Int(big), &bag)
+            .expect_err("a large int literal must not coerce through f64 either");
+        assert!(
+            err.reason().contains("fail-closed"),
+            "reason must say fail-closed: {}",
+            err.reason()
+        );
+    }
+
+    /// LLM tool arguments arrive as strings. `parse::<f64>()` rounds
+    /// `"9007199254740993"` onto 2^53, so a max-amount deny against an
+    /// int cap would skip. Integer spellings take the same exactness
+    /// bound as `Int`.
+    #[test]
+    fn a_string_encoded_large_int_does_not_round_through_f64() {
+        let rule = crate::parser::parse_rule("args.amount > 9007199254740992: deny", "test")
+            .expect("parses");
+        let mut bag = AttributeBag::new();
+        bag.set("args.amount", "9007199254740993");
+        match evaluate_rules(std::slice::from_ref(&rule), &bag) {
+            Decision::Deny { .. } => {},
+            other => panic!("2^53 + 1 as a string is over the cap, got {other:?}"),
+        }
+
+        bag.set("args.amount", "5000");
+        match evaluate_rules(std::slice::from_ref(&rule), &bag) {
+            Decision::Allow => {},
+            other => panic!("a small string amount must still compare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_int_float_order_within_exact_range_still_compares() {
+        let mut bag = AttributeBag::default();
+        bag.set("args.amount", AttributeValue::Int(10_000));
+        assert!(
+            eval_comparison("args.amount", CompareOp::Gt, &Literal::Float(9999.5), &bag),
+            "10000 > 9999.5 must hold"
+        );
+        assert!(
+            eval_comparison(
+                "args.amount",
+                CompareOp::Lt,
+                &Literal::Float(10_000.5),
+                &bag
+            ),
+            "10000 < 10000.5 must hold"
         );
     }
 
@@ -1814,6 +2079,10 @@ mod tests {
             "data.tenants[subject.tenant].data_region == 'eu'",
             &bag
         ));
+        assert!(
+            eval_pred("data.tenants[subject.tenant].data_region != 'eu'", &bag),
+            "NotEq on an unresolvable path must match !(==), not fall through"
+        );
     }
 
     #[test]
@@ -2082,13 +2351,174 @@ mod tests {
             !eval_condition(&cmp(CompareOp::Gt, 25000), &bag),
             "\"25000\" > 25000 is false"
         );
+    }
 
-        // A genuinely non-numeric string still doesn't order-compare.
-        bag.set("args.amount", "lots");
+    #[test]
+    fn missing_key_not_eq_is_true() {
+        // Duality: `x != "admin"` must match `!(x == "admin")` when x
+        // is absent. Returning false for NotEq let
+        // `role != "admin": deny` fall through to Allow for a request
+        // that simply omitted the attribute.
+        let bag = AttributeBag::new();
+        assert!(eval_condition(
+            &Condition::Comparison {
+                key: "subject.role".into(),
+                op: CompareOp::NotEq,
+                value: "admin".into(),
+            },
+            &bag,
+        ));
+        assert!(!eval_condition(
+            &Condition::Comparison {
+                key: "subject.role".into(),
+                op: CompareOp::Eq,
+                value: "admin".into(),
+            },
+            &bag,
+        ));
+    }
+
+    #[test]
+    fn missing_attribute_not_eq_deny_fails_closed() {
+        let rule = crate::parser::parse_rule(r#"subject.role != "admin": deny"#, "test")
+            .expect("a not-equal deny rule parses");
+        let bag = AttributeBag::new();
         assert!(
-            !eval_condition(&cmp(CompareOp::Gt, 10000), &bag),
-            "\"lots\" > 10000 is false"
+            matches!(evaluate_rules(&[rule], &bag), Decision::Deny { .. }),
+            "an allow-list deny must fire when the attribute is missing"
         );
+
+        let rule = crate::parser::parse_rule(r#"subject.role != "admin": deny"#, "test")
+            .expect("a not-equal deny rule parses");
+        let mut bag = AttributeBag::new();
+        bag.set("subject.role", "admin");
+        assert_eq!(
+            evaluate_rules(&[rule], &bag),
+            Decision::Allow,
+            "the matching role must not be denied"
+        );
+    }
+
+    #[test]
+    fn non_numeric_amount_order_deny_fails_closed() {
+        // `args.amount > 10000: deny` that treats a failed order
+        // comparison as false Allows `"NaN"` and `"-Infinity"` (IEEE
+        // `>` is false) and `"Infinity"` / `"lots"` once they are
+        // classified as non-numeric. Fail closed: the phase Denies,
+        // including under `!(...)`, so there is no boolean that permits.
+        let rule = crate::parser::parse_rule("args.amount > 10000: deny", "test")
+            .expect("max-amount deny parses");
+        let negated = crate::parser::parse_rule("!(args.amount > 10000): deny", "test")
+            .expect("negated max-amount deny parses");
+
+        let amounts: [AttributeValue; 10] = [
+            "NaN".into(),
+            "nan".into(),
+            "inf".into(),
+            "-inf".into(),
+            "Infinity".into(),
+            "-Infinity".into(),
+            "lots".into(),
+            f64::NAN.into(),
+            f64::INFINITY.into(),
+            f64::NEG_INFINITY.into(),
+        ];
+        let mut bag = AttributeBag::new();
+        for amount in amounts {
+            bag.set("args.amount", amount.clone());
+            match evaluate_rules(std::slice::from_ref(&rule), &bag) {
+                Decision::Deny { reason, .. } => {
+                    let reason = reason.expect("fail-closed deny carries a reason");
+                    assert!(
+                        reason.contains("fail-closed"),
+                        "{amount:?}: reason must say fail-closed: {reason}"
+                    );
+                    assert!(
+                        reason.contains("args.amount"),
+                        "{amount:?}: reason must name the key: {reason}"
+                    );
+                },
+                d => panic!("{amount:?}: a non-numeric amount must deny, got {d:?}"),
+            }
+            match evaluate_rules(std::slice::from_ref(&negated), &bag) {
+                Decision::Deny { reason, .. } => {
+                    let reason = reason.expect("fail-closed deny carries a reason");
+                    assert!(
+                        reason.contains("fail-closed"),
+                        "!(...): {amount:?}: {reason}"
+                    );
+                },
+                d => panic!("!(...) {amount:?} must still deny, got {d:?}"),
+            }
+        }
+
+        bag.set("args.amount", "5000");
+        assert_eq!(
+            evaluate_rules(std::slice::from_ref(&rule), &bag),
+            Decision::Allow,
+            "a finite amount under the cap must still allow"
+        );
+
+        bag.set("args.amount", "25000");
+        match evaluate_rules(std::slice::from_ref(&rule), &bag) {
+            Decision::Deny { reason, .. } => assert!(
+                !reason.as_deref().is_some_and(|r| r.contains("fail-closed")),
+                "a numeric over-cap deny is the rule, not Unorderable: {reason:?}"
+            ),
+            d => panic!("\"25000\" > 10000 must deny, got {d:?}"),
+        }
+
+        // Missing stays false (F5): the cap does not fire.
+        assert_eq!(
+            evaluate_rules(std::slice::from_ref(&rule), &AttributeBag::new()),
+            Decision::Allow,
+            "a missing amount is not Unorderable"
+        );
+    }
+
+    #[tokio::test]
+    async fn when_unorderable_amount_is_fail_closed() {
+        // `Effect::When` is a second evaluation entry: treating
+        // Unorderable as false would skip the body and Allow.
+        let mut bag = AttributeBag::new();
+        bag.set("args.amount", "NaN");
+        let steps = vec![Effect::When {
+            condition: crate::parser::parse_predicate("args.amount > 10000")
+                .expect("predicate parses"),
+            body: vec![Effect::Deny {
+                reason: Some("over cap".into()),
+                code: None,
+            }],
+            source: "when.test".into(),
+        }];
+        match evaluate_effects(
+            &steps,
+            &mut bag,
+            &(Arc::new(FakePdp {
+                decision: Decision::Allow,
+            }) as Arc<dyn PdpResolver>),
+            &null_plugins(),
+            &noop_delegations(),
+            &noop_elicitations(),
+            crate::step::DispatchPhase::Pre,
+            &mut crate::route::RoutePayload::new(serde_json::Value::Null),
+        )
+        .await
+        .decision
+        {
+            Decision::Deny {
+                reason,
+                rule_source,
+            } => {
+                let reason = reason.expect("fail-closed deny carries a reason");
+                assert!(
+                    reason.contains("fail-closed"),
+                    "reason must say fail-closed: {reason}"
+                );
+                assert_eq!(rule_source, "when.test");
+            },
+            d => panic!("an unorderable When condition must deny, got {d:?}"),
+        }
     }
 
     #[test]
@@ -2104,15 +2534,27 @@ mod tests {
             },
             &bag,
         ));
-        // Order operators on strings → false.
-        assert!(!eval_condition(
-            &Condition::Comparison {
+        // Order operators on a non-numeric string cannot be a boolean:
+        // `false` would skip a deny rule. The phase Denies instead.
+        let rule = rule(
+            Expression::Condition(Condition::Comparison {
                 key: "subject.id".into(),
                 op: CompareOp::Gt,
                 value: "alice".into(),
+            }),
+            deny("ordered strings"),
+            "test",
+        );
+        match evaluate_rules(&[rule], &bag) {
+            Decision::Deny { reason, .. } => {
+                let reason = reason.expect("fail-closed deny carries a reason");
+                assert!(
+                    reason.contains("fail-closed"),
+                    "reason must say fail-closed: {reason}"
+                );
             },
-            &bag,
-        ));
+            d => panic!("order on a non-numeric string must deny, got {d:?}"),
+        }
     }
 
     #[test]
@@ -3120,6 +3562,20 @@ mod tests {
         }
     }
 
+    /// Invoker that panics on every plugin call.
+    struct PanicPlugins;
+    #[async_trait]
+    impl PluginInvoker for PanicPlugins {
+        async fn invoke(
+            &self,
+            _name: &str,
+            _bag: &AttributeBag,
+            _invocation: PluginInvocation<'_>,
+        ) -> Result<PluginOutcome, PluginError> {
+            panic!("plugin blew up mid-branch");
+        }
+    }
+
     fn pdp_step(decision_diagnostic_label: &str) -> Effect {
         Effect::Pdp {
             call: PdpCall {
@@ -3986,6 +4442,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_panic_is_fail_closed() {
+        // A panicking parallel branch used to be dropped, so a sibling
+        // Allow became the block's result — a gate that never finished
+        // opened the route. Fail closed: the panic is a Deny.
+        struct PanickingPlugin;
+        #[async_trait]
+        impl PluginInvoker for PanickingPlugin {
+            async fn invoke(
+                &self,
+                _name: &str,
+                _bag: &AttributeBag,
+                _invocation: PluginInvocation<'_>,
+            ) -> Result<PluginOutcome, PluginError> {
+                panic!("simulated plugin panic");
+            }
+        }
+
+        let mut bag = AttributeBag::new();
+        let plugins: Arc<dyn PluginInvoker> = Arc::new(PanickingPlugin);
+        let steps = vec![Effect::Parallel(vec![
+            Effect::Allow,
+            Effect::Plugin {
+                name: "boom".into(),
+            },
+        ])];
+        match evaluate_effects(
+            &steps,
+            &mut bag,
+            &(Arc::new(FakePdp {
+                decision: Decision::Allow,
+            }) as Arc<dyn PdpResolver>),
+            &plugins,
+            &noop_delegations(),
+            &noop_elicitations(),
+            crate::step::DispatchPhase::Pre,
+            &mut crate::route::RoutePayload::new(serde_json::Value::Null),
+        )
+        .await
+        .decision
+        {
+            Decision::Deny { reason, .. } => {
+                let reason = reason.expect("fail-closed deny carries a reason");
+                assert!(
+                    reason.contains("fail-closed"),
+                    "reason must say fail-closed: {reason}"
+                );
+                assert!(
+                    reason.contains("panic"),
+                    "reason must name the panic: {reason}"
+                );
+                assert!(
+                    reason.contains("plugin(boom)"),
+                    "reason must name the panicking effect: {reason}"
+                );
+                assert!(
+                    reason.contains("branch 1"),
+                    "reason must name the branch index: {reason}"
+                );
+            },
+            d => panic!("a panicking parallel branch must deny, got {d:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn parallel_allows_when_no_branch_denies() {
         // Both branches are no-op Allow → overall Continue → route Allow.
         let mut bag = AttributeBag::new();
@@ -4060,6 +4580,44 @@ mod tests {
                 assert_eq!(reason.as_deref(), Some("branch 1 denied"));
             },
             other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_panicked_branch_fails_closed() {
+        let mut bag = AttributeBag::new();
+        let mut payload = crate::route::RoutePayload::new(json!({}));
+
+        let rule = Rule {
+            condition: Expression::Always,
+            effects: vec![Effect::Parallel(vec![
+                Effect::Plugin {
+                    name: "guard".into(),
+                },
+                Effect::Allow,
+            ])],
+            source: "test.policy[0]".into(),
+        };
+
+        let eval = evaluate_effects(
+            &vec![Effect::from(rule)],
+            &mut bag,
+            &(Arc::new(FakePdp {
+                decision: Decision::Allow,
+            }) as Arc<dyn PdpResolver>),
+            &(Arc::new(PanicPlugins) as Arc<dyn PluginInvoker>),
+            &noop_delegations(),
+            &noop_elicitations(),
+            crate::step::DispatchPhase::Pre,
+            &mut payload,
+        )
+        .await;
+
+        match eval.decision {
+            Decision::Deny { rule_source, .. } => {
+                assert_eq!(rule_source, "parallel.branch_panic");
+            },
+            other => panic!("panicked branch must deny, got {other:?}"),
         }
     }
 

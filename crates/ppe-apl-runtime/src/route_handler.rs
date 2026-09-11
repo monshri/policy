@@ -844,7 +844,18 @@ fn extensions_changed(before: &Extensions, after: &Extensions) -> bool {
         (None, None) => false,
         _ => true,
     };
-    security_changed || delegation_changed || raw_creds_changed
+    // `http` and `custom` are mutable slots; `candidate_constraint` is handled above.
+    let http_changed = match (before.http.as_ref(), after.http.as_ref()) {
+        (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+        (None, None) => false,
+        _ => true,
+    };
+    let custom_changed = match (before.custom.as_ref(), after.custom.as_ref()) {
+        (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+        (None, None) => false,
+        _ => true,
+    };
+    security_changed || delegation_changed || raw_creds_changed || http_changed || custom_changed
 }
 
 /// Extract the elicitation id an agent echoes on retry from the
@@ -1157,6 +1168,30 @@ mod tests {
         assert!(extensions_changed(&before, &after));
     }
 
+    #[test]
+    fn an_http_change_alone_is_detected() {
+        use praxis_policy_core::extensions::HttpExtension;
+        let before = Extensions::default();
+        let after = Extensions {
+            http: Some(Arc::new(HttpExtension::default())),
+            ..Extensions::default()
+        };
+        assert!(
+            extensions_changed(&before, &after),
+            "a header write must not be mistaken for no change"
+        );
+    }
+
+    #[test]
+    fn a_custom_change_alone_is_detected() {
+        let before = Extensions::default();
+        let after = Extensions {
+            custom: Some(Arc::new(std::collections::HashMap::new())),
+            ..Extensions::default()
+        };
+        assert!(extensions_changed(&before, &after));
+    }
+
     /// The arm that actually runs in production, for both slots that a route can
     /// mutate without touching security.
     ///
@@ -1209,6 +1244,43 @@ mod tests {
                 &with_chain(&Arc::new(DelegationExtension::default()))
             ),
             "a replaced delegation chain must be detected"
+        );
+
+        // Cover replacement of an existing mutable slot, not only `None -> Some`.
+        use praxis_policy_core::extensions::HttpExtension;
+        let http = Arc::new(HttpExtension::default());
+        let with_http = |c: &Arc<HttpExtension>| Extensions {
+            http: Some(Arc::clone(c)),
+            ..Extensions::default()
+        };
+        assert!(
+            !extensions_changed(&with_http(&http), &with_http(&http)),
+            "the same http Arc on both sides is not a change"
+        );
+        assert!(
+            extensions_changed(
+                &with_http(&http),
+                &with_http(&Arc::new(HttpExtension::default()))
+            ),
+            "a replaced http slot (a header rewrite) must be detected"
+        );
+
+        type CustomMap = std::collections::HashMap<String, serde_json::Value>;
+        let custom: Arc<CustomMap> = Arc::new(CustomMap::new());
+        let with_custom = |c: &Arc<CustomMap>| Extensions {
+            custom: Some(Arc::clone(c)),
+            ..Extensions::default()
+        };
+        assert!(
+            !extensions_changed(&with_custom(&custom), &with_custom(&custom)),
+            "the same custom Arc on both sides is not a change"
+        );
+        assert!(
+            extensions_changed(
+                &with_custom(&custom),
+                &with_custom(&Arc::new(CustomMap::new()))
+            ),
+            "a replaced custom slot must be detected"
         );
     }
 }

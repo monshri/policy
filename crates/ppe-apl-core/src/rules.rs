@@ -334,6 +334,34 @@ impl Effect {
         }
     }
 
+    /// Count the `Elicit` nodes reachable in this effect subtree.
+    ///
+    /// Validators reject multiple elicitations per phase because the protocol
+    /// has one shared elicitation id. Conditional and PDP arms are summed
+    /// conservatively because different arms may run across retries.
+    pub fn count_elicits(&self) -> usize {
+        match self {
+            Effect::Elicit(_) => 1,
+            Effect::Sequential(effects) | Effect::Parallel(effects) => {
+                effects.iter().map(Effect::count_elicits).sum()
+            },
+            Effect::When { body, .. } => body.iter().map(Effect::count_elicits).sum(),
+            Effect::Pdp {
+                on_allow, on_deny, ..
+            } => {
+                on_allow.iter().map(Effect::count_elicits).sum::<usize>()
+                    + on_deny.iter().map(Effect::count_elicits).sum::<usize>()
+            },
+            Effect::Allow
+            | Effect::Deny { .. }
+            | Effect::Plugin { .. }
+            | Effect::Taint { .. }
+            | Effect::Restrict { .. }
+            | Effect::FieldOp { .. }
+            | Effect::Delegate(_) => 0,
+        }
+    }
+
     /// Walk the effect tree rejecting any `FieldOp` / `Delegate` that
     /// lives directly or transitively under a `Parallel` node. Returns
     /// the path string of the first violation found (or `Ok(())` if
@@ -973,6 +1001,51 @@ mod tests {
                 "tag.hr.policy[0]",
                 "route.policy[0]",
             ]
+        );
+    }
+
+    #[test]
+    fn count_elicits_sums_through_control_flow() {
+        let elicit = |name: &str| {
+            Effect::Elicit(crate::step::ElicitStep {
+                kind: crate::step::ElicitKind::Approval,
+                plugin_name: name.into(),
+                channel: None,
+                from: "user.manager".into(),
+                purpose: None,
+                scope: None,
+                timeout: None,
+                config_override: None,
+                on_error: None,
+                source: "test".into(),
+            })
+        };
+        assert_eq!(Effect::Allow.count_elicits(), 0);
+        assert_eq!(elicit("a").count_elicits(), 1);
+        assert_eq!(
+            Effect::When {
+                condition: Expression::Always,
+                body: vec![elicit("a"), elicit("b")],
+                source: "test".into(),
+            }
+            .count_elicits(),
+            2
+        );
+        assert_eq!(
+            Effect::Sequential(vec![elicit("a"), Effect::Allow, elicit("b")]).count_elicits(),
+            2
+        );
+        assert_eq!(
+            Effect::Pdp {
+                call: crate::step::PdpCall {
+                    dialect: crate::step::PdpDialect::Cedar,
+                    args: serde_yaml::Value::Null,
+                },
+                on_allow: vec![elicit("a")],
+                on_deny: vec![elicit("b")],
+            }
+            .count_elicits(),
+            2
         );
     }
 

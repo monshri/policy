@@ -149,9 +149,19 @@ pub struct TrustedIssuerConfig {
     /// Expected `iss` claim value.
     pub issuer: String,
 
-    /// Expected audience(s). Empty list disables `aud` validation.
+    /// Expected audience(s). Tokens must carry at least one matching
+    /// `aud` value. An empty list disables `aud` validation only when
+    /// [`skip_audience_validation`](Self::skip_audience_validation) is
+    /// set; omitting both is refused at load, the same class as an
+    /// empty algorithm list.
     #[serde(default)]
     pub audiences: Vec<String>,
+
+    /// Opt out of `aud` checking. Default is to require
+    /// [`audiences`](Self::audiences). Setting this together with a
+    /// non-empty audience list is refused: the two readings conflict.
+    #[serde(default)]
+    pub skip_audience_validation: bool,
 
     /// Algorithms accepted for signature verification (e.g.,
     /// `RS256`, `ES256`). At least one required.
@@ -735,15 +745,18 @@ impl std::fmt::Display for KeySourceError {
 impl std::error::Error for KeySourceError {}
 
 impl TrustedIssuerConfig {
-    /// Validate shape (non-empty issuer, at least one algorithm)
+    /// Validate shape (non-empty issuer, at least one algorithm,
+    /// audiences configured or explicitly skipped)
     /// without resolving the key. Used at construction time as a
     /// fast-fail gate so misshapen YAML is rejected before any
     /// network I/O is attempted.
     /// # Errors
     ///
-    /// Returns a message when `issuer` is empty or `algorithms` is empty. An
-    /// issuer with no accepted algorithm can verify nothing, so it is rejected
-    /// here rather than failing every token later.
+    /// Returns a message when `issuer` is empty, `algorithms` is empty, or
+    /// audience checking is neither configured nor explicitly skipped. An
+    /// issuer with no accepted algorithm can verify nothing; an issuer
+    /// with no audiences and no skip flag accepts a token minted for
+    /// any app.
     pub fn validate(&self) -> Result<(), String> {
         if self.issuer.trim().is_empty() {
             return Err("trusted_issuer.issuer must be non-empty".into());
@@ -751,6 +764,20 @@ impl TrustedIssuerConfig {
         if self.algorithms.is_empty() {
             return Err(format!(
                 "trusted_issuer '{}' must list at least one algorithm",
+                self.issuer
+            ));
+        }
+        if !self.skip_audience_validation && self.audiences.is_empty() {
+            return Err(format!(
+                "trusted_issuer '{}' must list at least one audience \
+                 (or set skip_audience_validation: true)",
+                self.issuer
+            ));
+        }
+        if self.skip_audience_validation && !self.audiences.is_empty() {
+            return Err(format!(
+                "trusted_issuer '{}' sets skip_audience_validation together \
+                 with audiences; pick one",
                 self.issuer
             ));
         }
@@ -781,6 +808,7 @@ impl TrustedIssuerConfig {
         Ok(TrustedIssuer {
             issuer: self.issuer,
             audiences: self.audiences,
+            skip_audience_validation: self.skip_audience_validation,
             keys: std::sync::Arc::new(std::sync::RwLock::new(keys)),
             algorithms: self.algorithms,
             leeway_seconds: self.leeway_seconds,
@@ -829,6 +857,7 @@ impl TrustedIssuerConfig {
         Ok(TrustedIssuer {
             issuer: self.issuer,
             audiences: self.audiences,
+            skip_audience_validation: self.skip_audience_validation,
             keys: std::sync::Arc::new(std::sync::RwLock::new(keys)),
             algorithms: self.algorithms,
             leeway_seconds: self.leeway_seconds,
@@ -1175,6 +1204,7 @@ mod tests {
         let cfg = TrustedIssuerConfig {
             issuer: String::new(),
             audiences: vec!["a".to_owned()],
+            skip_audience_validation: false,
             algorithms: vec![Algorithm::HS256],
             decoding_key: DecodingKeySource::Secret { secret: "s".into() },
             leeway_seconds: 0,
@@ -1183,5 +1213,43 @@ mod tests {
             panic!("an empty issuer must not validate")
         };
         assert!(e.contains("issuer"), "{e}");
+    }
+
+    fn issuer_for_audience_checks(audiences: Vec<String>, skip: bool) -> TrustedIssuerConfig {
+        TrustedIssuerConfig {
+            issuer: "https://idp.example".into(),
+            audiences,
+            skip_audience_validation: skip,
+            algorithms: vec![Algorithm::HS256],
+            decoding_key: DecodingKeySource::Secret { secret: "s".into() },
+            leeway_seconds: 0,
+        }
+    }
+
+    /// Omitted and explicitly empty `audiences` are the same fault when skip
+    /// is off: the issuer would accept a token minted for any app.
+    #[test]
+    fn omitted_and_empty_audiences_share_the_same_load_error() {
+        let omitted = issuer_for_audience_checks(Vec::new(), false);
+        let explicit = issuer_for_audience_checks(vec![], false);
+        let omitted_err = omitted.validate().expect_err("omitted audiences must fail");
+        let explicit_err = explicit.validate().expect_err("empty audiences must fail");
+        assert!(
+            omitted_err.contains("at least one audience"),
+            "{omitted_err}"
+        );
+        assert_eq!(
+            omitted_err, explicit_err,
+            "omitted and `audiences: []` must not produce different messages"
+        );
+    }
+
+    #[test]
+    fn skip_with_a_list_is_still_a_conflict() {
+        let err = issuer_for_audience_checks(vec!["app".into()], true)
+            .validate()
+            .expect_err("skip plus a list must fail");
+        assert!(err.contains("skip_audience_validation"), "{err}");
+        assert!(err.contains("pick one"), "{err}");
     }
 }

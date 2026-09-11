@@ -31,7 +31,11 @@
 // so a stray feature unification cannot silently give a host a second
 // HTTP stack it did not ask for.
 
+use std::error::Error;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,11 +44,18 @@ use http_body_util::{BodyExt as _, Full, LengthLimitError, Limited};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use praxis_policy_core::http::{HttpRequest, HttpResponse, HttpTransport, HttpTransportError};
+use praxis_policy_core::http_addr::private_address_reason;
+use tower_service::Service;
+
+/// Marker in resolver errors so [`classify`] can turn a filtered DNS
+/// result into [`HttpTransportError::Rejected`] rather than `Connect`.
+const EGRESS_DENIED_PREFIX: &str = "ppe-egress-denied:";
 
 /// The pooling client, shared by every request this transport serves.
-type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+type HyperClient = Client<HttpsConnector<HttpConnector<EgressResolver>>, Full<Bytes>>;
 
 /// A `HttpTransport` backed by hyper with rustls.
 ///
@@ -70,6 +81,9 @@ pub struct HyperTransport {
     pool_max_idle_per_host: usize,
     tcp_keepalive: Option<Duration>,
     http2: bool,
+    /// When true, skip [`http_addr`](praxis_policy_core::http_addr). For a
+    /// local `IdP` or a test harness on loopback. Default is false.
+    allow_private_destinations: bool,
 }
 
 impl Default for HyperTransport {
@@ -93,6 +107,7 @@ impl Default for HyperTransport {
             // ALPN offers h2 and falls back to http/1.1, so this costs
             // nothing against a peer that does not speak it.
             http2: true,
+            allow_private_destinations: false,
         }
     }
 }
@@ -188,55 +203,94 @@ impl HyperTransport {
         self
     }
 
-    /// The shared client, built on first call.
-    fn client(&self) -> &HyperClient {
-        self.client.get_or_init(|| {
-            let mut http = HttpConnector::new();
-            // The HTTPS connector wraps this one, so it must accept the
-            // `https` scheme rather than rejecting it as non-HTTP.
-            http.enforce_http(false);
-            http.set_connect_timeout(Some(self.connect_timeout));
-            // hyper-util defaults this to false; reqwest sets it true.
-            // Leaving Nagle on would let a small request body — a token
-            // exchange form is a couple of hundred bytes — sit waiting to
-            // coalesce with data that never comes, adding tens of
-            // milliseconds to a call on the request path.
-            http.set_nodelay(true);
-            http.set_keepalive(self.tcp_keepalive);
+    /// Permit destinations [`http_addr`](praxis_policy_core::http_addr)
+    /// would refuse: loopback, RFC 1918, link-local (including cloud
+    /// metadata), CGNAT.
+    ///
+    /// Default is to refuse them. Reach for this when the `IdP` is on
+    /// the same machine, or in tests that bind a mock on `127.0.0.1`.
+    /// A host that injects its own transport never sees this knob —
+    /// that transport's egress policy is the one that counts.
+    #[must_use]
+    pub fn with_allow_private_destinations(mut self) -> Self {
+        self.allow_private_destinations = true;
+        self
+    }
 
-            let tls = hyper_rustls::HttpsConnectorBuilder::new()
-                // Webpki roots rather than the system store, matching
-                // what the reqwest path resolved to and keeping the
-                // trust set identical across every deployment.
-                .with_webpki_roots()
-                // `https_or_http`, not `https_only`: `identity-jwt`
-                // supports an explicit `insecure_http: true` for local
-                // development, and it already refuses plaintext by
-                // default one layer up. Enforcing here as well would
-                // make that setting silently ineffective.
-                .https_or_http();
+    /// Return the shared client, building it on first use.
+    fn client(&self) -> Result<&HyperClient, HttpTransportError> {
+        if let Some(client) = self.client.get() {
+            return Ok(client);
+        }
+        let built = Self::build_client(self)?;
+        // Another caller may win the race; use whichever equivalent client was stored.
+        let _ = self.client.set(built);
+        self.client
+            .get()
+            .ok_or_else(|| HttpTransportError::Connect("HTTP client init raced".to_owned()))
+    }
 
-            // `enable_all_versions` advertises ALPN `h2, http/1.1`;
-            // `enable_http1` advertises none. Either way a peer that
-            // cannot do HTTP/2 gets HTTP/1.1, and plaintext gets it
-            // regardless since there is no ALPN without TLS.
-            let https = if self.http2 {
-                tls.enable_all_versions().wrap_connector(http)
-            } else {
-                tls.enable_http1().wrap_connector(http)
-            };
+    /// Build a pooling client.
+    fn build_client(&self) -> Result<HyperClient, HttpTransportError> {
+        let mut http = HttpConnector::new_with_resolver(EgressResolver {
+            allow_private: self.allow_private_destinations,
+        });
+        // The HTTPS connector wraps this one, so it must accept the
+        // `https` scheme rather than rejecting it as non-HTTP.
+        http.enforce_http(false);
+        http.set_connect_timeout(Some(self.connect_timeout));
+        // hyper-util defaults this to false; reqwest sets it true.
+        // Leaving Nagle on would let a small request body — a token
+        // exchange form is a couple of hundred bytes — sit waiting to
+        // coalesce with data that never comes, adding tens of
+        // milliseconds to a call on the request path.
+        http.set_nodelay(true);
+        http.set_keepalive(self.tcp_keepalive);
 
-            Client::builder(TokioExecutor::new())
-                // Without a timer, `pool_idle_timeout` silently does
-                // nothing and idle connections are never evicted. With
-                // `pool_max_idle_per_host` defaulting to unlimited, that
-                // is unbounded socket growth against a busy `IdP`, which
-                // is a slow leak rather than an error anyone would see.
-                .pool_timer(TokioTimer::new())
-                .pool_idle_timeout(self.pool_idle_timeout)
-                .pool_max_idle_per_host(self.pool_max_idle_per_host)
-                .build(https)
-        })
+        // Select `ring` locally: a host may load both supported providers,
+        // leaving rustls without a process default. Do not install one here.
+        // Keep the webpki roots used by the previous connector configuration.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| HttpTransportError::Connect(format!("rustls client configuration: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let tls = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            // `https_or_http`, not `https_only`: `identity-jwt`
+            // supports an explicit `insecure_http: true` for local
+            // development, and it already refuses plaintext by
+            // default one layer up. Enforcing here as well would
+            // make that setting silently ineffective.
+            .https_or_http();
+
+        // `enable_all_versions` advertises ALPN `h2, http/1.1`;
+        // `enable_http1` advertises none. Either way a peer that
+        // cannot do HTTP/2 gets HTTP/1.1, and plaintext gets it
+        // regardless since there is no ALPN without TLS.
+        let https = if self.http2 {
+            tls.enable_all_versions().wrap_connector(http)
+        } else {
+            tls.enable_http1().wrap_connector(http)
+        };
+
+        let client = Client::builder(TokioExecutor::new())
+            // Without a timer, `pool_idle_timeout` silently does
+            // nothing and idle connections are never evicted. With
+            // `pool_max_idle_per_host` defaulting to unlimited, that
+            // is unbounded socket growth against a busy `IdP`, which
+            // is a slow leak rather than an error anyone would see.
+            .pool_timer(TokioTimer::new())
+            .pool_idle_timeout(self.pool_idle_timeout)
+            .pool_max_idle_per_host(self.pool_max_idle_per_host)
+            .build(https);
+
+        Ok(client)
     }
 }
 
@@ -246,14 +300,88 @@ impl HyperTransport {
 /// the request: a caller uses it to decide between retrying and
 /// recording an indeterminate outcome. `is_connect()` is the only signal
 /// hyper gives us that nothing was sent, so anything else is `Io`, which
-/// reads as "may have reached the peer" and is the safe direction to err
+/// reads as "may have reached the peer" and the safe direction to err
 /// in. Guessing `Connect` for an ambiguous failure would license a retry
 /// that mints a second token.
+///
+/// hyper-util's Display is `client error ({kind})` and does not include
+/// the source chain, so matching that string never sees
+/// [`EGRESS_DENIED_PREFIX`]. Walk [`Error::source`] instead; otherwise a
+/// filtered hostname reports `Connect`, maps to `idp_unreachable`, and
+/// is retried against a destination that can never be reached.
 fn classify(err: &hyper_util::client::legacy::Error) -> HttpTransportError {
+    if let Some(reason) = denied_reason(err) {
+        return HttpTransportError::Rejected(reason);
+    }
+    let msg = err.to_string();
     if err.is_connect() {
-        HttpTransportError::Connect(err.to_string())
+        HttpTransportError::Connect(msg)
     } else {
-        HttpTransportError::Io(err.to_string())
+        HttpTransportError::Io(msg)
+    }
+}
+
+/// The private-address reason [`EgressResolver`] stuffed behind
+/// [`EGRESS_DENIED_PREFIX`], if any layer of `err` carries it.
+fn denied_reason(err: &(dyn Error + 'static)) -> Option<String> {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some((_, reason)) = e.to_string().split_once(EGRESS_DENIED_PREFIX) {
+            return Some(reason.trim().to_owned());
+        }
+        cur = e.source();
+    }
+    None
+}
+
+/// DNS resolver that drops addresses [`private_address_reason`] would
+/// refuse. IP literals never hit DNS, so [`HyperTransport::execute`]
+/// checks those separately; this is the connect-time check the table's
+/// docs require, so a name that rebinds from public to metadata is
+/// refused on the lookup that actually dials.
+///
+/// The connector dials the `SocketAddr`s this resolver returns. A later
+/// DNS update does not change the peer: we never resolve a second time
+/// between the filter and `connect`. The residual is that an address we
+/// accepted is still a public host, and this transport cannot see whether
+/// that host forwards to a private one.
+#[derive(Clone, Copy, Debug)]
+struct EgressResolver {
+    allow_private: bool,
+}
+
+impl Service<Name> for EgressResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        let allow_private = self.allow_private;
+        let fut = GaiResolver::new().call(name);
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = fut.await?.collect();
+            if allow_private {
+                return Ok(addrs.into_iter());
+            }
+            let mut kept = Vec::new();
+            let mut denied = None;
+            for addr in addrs {
+                match private_address_reason(&addr.ip()) {
+                    Some(reason) => denied = Some(reason),
+                    None => kept.push(addr),
+                }
+            }
+            if kept.is_empty() {
+                let reason = denied.unwrap_or("no resolvable addresses");
+                return Err(format!("{EGRESS_DENIED_PREFIX}{reason}").into());
+            }
+            Ok(kept.into_iter())
+        })
     }
 }
 
@@ -272,6 +400,19 @@ impl HttpTransport for HyperTransport {
             )));
         }
 
+        // Build the pool even when the destination is later refused, so
+        // a refused first request still lands the client on the runtime
+        // that served it.
+        let client = self.client()?;
+
+        if !self.allow_private_destinations
+            && let Some(host) = uri.host()
+            && let Some(ip) = host_as_ip(host)
+            && let Some(reason) = private_address_reason(&ip)
+        {
+            return Err(HttpTransportError::Rejected(reason.to_owned()));
+        }
+
         let mut builder = http::Request::builder().method(req.method.clone()).uri(uri);
         // Safe: `Request::builder()` starts with an empty header map and
         // no error, so the map is present until a fallible step runs.
@@ -285,7 +426,6 @@ impl HttpTransport for HyperTransport {
         // `req.connect_timeout` is not consulted: the bound belongs to the
         // shared connector. See `with_connect_timeout`. The overall
         // deadline below still covers the connect phase.
-        let client = self.client();
         let limit = req.max_response_bytes;
 
         // The deadline covers the *whole* exchange, headers and body.
@@ -336,6 +476,21 @@ impl HttpTransport for HyperTransport {
     }
 }
 
+/// Parse a URI host as an IP address.
+///
+/// `http::Uri::host()` keeps the brackets on an IPv6 literal
+/// (`[::ffff:169.254.169.254]`), and that string does not parse as
+/// [`IpAddr`]. Stripping them is what makes the pre-connect check see
+/// the same address hyper would dial. A hostname is `None` and goes
+/// through [`EgressResolver`] instead.
+fn host_as_ip(host: &str) -> Option<IpAddr> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse().ok()
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -364,6 +519,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_link_local_literal_is_rejected_without_dialling() {
+        // 169.254.169.254 is cloud metadata. The table exists so this
+        // transport refuses it at the address it would connect to, not
+        // after the bytes have left.
+        let t = HyperTransport::new();
+        let err = t
+            .execute(HttpRequest::get("http://169.254.169.254/latest/meta-data/"))
+            .await
+            .expect_err("metadata is not a public destination");
+        assert!(!err.may_have_reached_peer());
+        match err {
+            HttpTransportError::Rejected(reason) => {
+                assert!(
+                    reason.contains("link-local") || reason.contains("metadata"),
+                    "the refusal must name the rule: {reason}"
+                );
+            },
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_private_literal_is_rejected_without_dialling() {
+        let t = HyperTransport::new();
+        let err = t
+            .execute(HttpRequest::get("http://10.0.0.1/jwks"))
+            .await
+            .expect_err("RFC 1918 is not a public destination");
+        assert!(!err.may_have_reached_peer());
+        match err {
+            HttpTransportError::Rejected(reason) => {
+                assert!(
+                    reason.contains("private"),
+                    "the refusal must name the rule: {reason}"
+                );
+            },
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_is_rejected_unless_the_hatch_is_set() {
+        let err = HyperTransport::new()
+            .execute(HttpRequest::get("http://127.0.0.1:1/jwks"))
+            .await
+            .expect_err("loopback is in the egress table");
+        assert!(
+            matches!(err, HttpTransportError::Rejected(_)),
+            "expected Rejected, got {err:?}"
+        );
+        assert!(!err.may_have_reached_peer());
+    }
+
+    #[tokio::test]
+    async fn a_mapped_ipv6_metadata_literal_is_rejected_without_dialling() {
+        // `Uri::host()` keeps the brackets on an IPv6 literal. Parsing
+        // that string as `IpAddr` fails, which used to skip the table
+        // and dial. The same address in dotted v4 is already refused.
+        let t = HyperTransport::new();
+        let err = t
+            .execute(HttpRequest::get(
+                "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            ))
+            .await
+            .expect_err("mapped metadata is the same host");
+        assert!(!err.may_have_reached_peer());
+        assert!(
+            matches!(err, HttpTransportError::Rejected(_)),
+            "expected Rejected, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_loopback_literal_is_rejected_without_dialling() {
+        let err = HyperTransport::new()
+            .execute(HttpRequest::get("http://[::1]:1/jwks"))
+            .await
+            .expect_err("IPv6 loopback is in the egress table");
+        assert!(
+            matches!(err, HttpTransportError::Rejected(_)),
+            "expected Rejected, got {err:?}"
+        );
+        assert!(!err.may_have_reached_peer());
+    }
+
+    #[tokio::test]
+    async fn a_hostname_resolving_to_loopback_is_rejected_not_connect() {
+        // IP literals take the pre-connect check and never enter
+        // `EgressResolver`. A name has to, and hyper's Display is
+        // `client error (Connect)` — matching that string used to
+        // report Connect, which retried and mapped to idp_unreachable.
+        let err = HyperTransport::new()
+            .execute(HttpRequest::get("http://localhost:1/jwks"))
+            .await
+            .expect_err("localhost resolves to loopback");
+        assert!(
+            matches!(err, HttpTransportError::Rejected(_)),
+            "expected Rejected, got {err:?}"
+        );
+        assert!(!err.may_have_reached_peer());
+    }
+
+    #[test]
+    fn classify_walks_the_source_chain_for_the_egress_marker() {
+        // hyper-util formats as `client error (Connect)` and keeps the
+        // resolver error on `source()`, the way the live client does.
+        #[derive(Debug)]
+        struct Marker(&'static str);
+        impl std::fmt::Display for Marker {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl Error for Marker {}
+
+        #[derive(Debug)]
+        struct Wrap(Marker);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("client error (Connect)")
+            }
+        }
+        impl Error for Wrap {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let err = Wrap(Marker("ppe-egress-denied:loopback"));
+        assert_eq!(denied_reason(&err).as_deref(), Some("loopback"));
+        assert!(denied_reason(&Marker("client error (Connect)")).is_none());
+    }
+
+    #[tokio::test]
     async fn a_url_with_no_host_is_rejected_before_dialling() {
         let t = HyperTransport::new();
         let err = t
@@ -377,8 +666,10 @@ mod tests {
     async fn a_connection_refused_reports_connect_and_is_retryable() {
         // Port 1 on loopback: nothing listens, and the refusal arrives
         // without anything being sent — so a caller may safely retry
-        // even a token mint.
-        let t = HyperTransport::new();
+        // even a token mint. Loopback is in the egress table, so this
+        // path uses the local-IdP hatch; the table itself is tested
+        // separately.
+        let t = HyperTransport::new().with_allow_private_destinations();
         let err = t
             .execute(HttpRequest::get("http://127.0.0.1:1/jwks"))
             .await
@@ -406,6 +697,27 @@ mod tests {
         );
         let _ = t.execute(HttpRequest::get("http://127.0.0.1:1/x")).await;
         assert!(t.client.get().is_some(), "first use must build the pool");
+    }
+
+    #[tokio::test]
+    async fn the_pool_builds_with_no_process_default_crypto_provider() {
+        // Building against the named provider must neither require nor install a default.
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_none(),
+            "the guard only means something while nothing has installed a default"
+        );
+        let t = HyperTransport::new();
+        // A closed loopback port builds the client, then fails to connect.
+        let _ = t.execute(HttpRequest::get("https://127.0.0.1:1/x")).await;
+        assert!(
+            t.client.get().is_some(),
+            "the pool must build against the named provider"
+        );
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_none(),
+            "naming a provider must not install one process-wide, which would \
+             race a host installing its own"
+        );
     }
 
     #[test]
@@ -470,6 +782,20 @@ mod tests {
                 .with_connect_timeout(Duration::from_millis(250))
                 .connect_timeout,
             Duration::from_millis(250),
+        );
+    }
+
+    #[test]
+    fn ipv6_uri_hosts_are_parsed_despite_brackets() {
+        // `http::Uri::host()` keeps brackets on IPv6. The pre-connect
+        // check has to strip them or every v6 literal skips the table.
+        let mapped: IpAddr = host_as_ip("[::ffff:169.254.169.254]").expect("mapped v6");
+        assert!(private_address_reason(&mapped).is_some());
+        assert!(host_as_ip("[::1]").is_some());
+        assert!(host_as_ip("127.0.0.1").is_some());
+        assert!(
+            host_as_ip("idp.example").is_none(),
+            "a hostname must go through DNS, not the literal table"
         );
     }
 

@@ -194,7 +194,9 @@ pub enum AuthEnforcedBy {
 /// minted token's scope claim. v0 doesn't include a template
 /// renderer — handlers receive the raw template string and render
 /// themselves; a framework-side renderer can come later.
+// Unknown fields fail closed because silently dropping attenuation can widen a credential.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttenuationConfig {
     /// Specific capabilities the route author wants granted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

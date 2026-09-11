@@ -434,8 +434,63 @@ pub struct RawCredentialsExtension {
     /// handlers and cached for re-use. Read with
     /// `read_delegated_tokens`; write with `write_delegated_tokens`
     /// (`TokenDelegate` handlers only).
-    #[serde(default)]
+    ///
+    /// Serialized as `[key, value]` pairs because JSON object keys must be
+    /// strings. Token bytes remain excluded by `#[serde(skip)]`.
+    #[serde(default, with = "delegated_tokens_as_pairs")]
     pub delegated_tokens: HashMap<DelegationKey, RawDelegatedToken>,
+}
+
+/// Serialize `delegated_tokens` as pairs so its structured keys work in JSON.
+///
+/// Deserialization also accepts the legacy map form; older code could emit an
+/// empty map even though non-empty structured-key maps failed to serialize.
+mod delegated_tokens_as_pairs {
+    use super::{DelegationKey, RawDelegatedToken};
+    use serde::de::{MapAccess, SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize as _, Serializer};
+    use std::collections::HashMap;
+
+    pub(super) fn serialize<S: Serializer>(
+        map: &HashMap<DelegationKey, RawDelegatedToken>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let pairs: Vec<(&DelegationKey, &RawDelegatedToken)> = map.iter().collect();
+        pairs.serialize(serializer)
+    }
+
+    struct MapOrPairs;
+
+    impl<'de> Visitor<'de> for MapOrPairs {
+        type Value = HashMap<DelegationKey, RawDelegatedToken>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a sequence of [key, value] pairs or a map")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut map = HashMap::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some((k, v)) = seq.next_element::<(DelegationKey, RawDelegatedToken)>()? {
+                map.insert(k, v);
+            }
+            Ok(map)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            // Accept legacy JSON objects, normally `{}`.
+            let mut map = HashMap::with_capacity(access.size_hint().unwrap_or(0));
+            while let Some((k, v)) = access.next_entry::<DelegationKey, RawDelegatedToken>()? {
+                map.insert(k, v);
+            }
+            Ok(map)
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<DelegationKey, RawDelegatedToken>, D::Error> {
+        deserializer.deserialize_any(MapOrPairs)
+    }
 }
 
 #[cfg(test)]
@@ -609,5 +664,51 @@ mod tests {
         let restored_tok = restored.inbound_tokens.get(&TokenRole::User).unwrap();
         assert_eq!(&*restored_tok.token, "");
         assert_eq!(restored_tok.source_header, "X-User-Token");
+    }
+
+    #[test]
+    fn delegated_tokens_serialize_without_error_and_round_trip() {
+        let mut ext = RawCredentialsExtension::default();
+        let key = DelegationKey::new(
+            DelegationMode::OnBehalfOfUser,
+            "workday-api",
+            vec!["read:comp".to_owned()],
+        )
+        .with_subject_id("user-1");
+        ext.delegated_tokens.insert(
+            key.clone(),
+            RawDelegatedToken::new(
+                "minted-secret",
+                "Authorization",
+                "workday-api",
+                vec!["read:comp".to_owned()],
+                chrono::Utc::now(),
+            ),
+        );
+
+        let json = serde_json::to_string(&ext).expect("delegated_tokens must serialize");
+        assert!(
+            !json.contains("minted-secret"),
+            "token bytes must be dropped"
+        );
+
+        let restored: RawCredentialsExtension = serde_json::from_str(&json).unwrap();
+        let restored_tok = restored
+            .delegated_tokens
+            .get(&key)
+            .expect("the key must round-trip");
+        assert_eq!(&*restored_tok.token, "", "token stays skipped");
+        assert_eq!(restored_tok.audience, "workday-api");
+    }
+
+    #[test]
+    fn legacy_empty_map_delegated_tokens_still_deserializes() {
+        let legacy = r#"{"inbound_tokens":{},"delegated_tokens":{}}"#;
+        let restored: RawCredentialsExtension = serde_json::from_str(legacy).unwrap();
+        assert!(restored.delegated_tokens.is_empty());
+
+        let modern = r#"{"inbound_tokens":{},"delegated_tokens":[]}"#;
+        let restored: RawCredentialsExtension = serde_json::from_str(modern).unwrap();
+        assert!(restored.delegated_tokens.is_empty());
     }
 }

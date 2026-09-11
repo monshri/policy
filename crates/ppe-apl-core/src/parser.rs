@@ -3,8 +3,8 @@
 
 // APL parser: policy text to IR.
 //
-// The grammar this accepts is written down in docs/apl-grammar.md, and that
-// document is normative. This file used to carry the description instead, in a
+// The grammar this accepts is written down in docs/content/apl/apl-grammar.md,
+// and that document is normative. This file used to carry the description instead, in a
 // comment block that had gone wrong on four counts: it claimed steps, pipe chains,
 // `in` / `not in` / `exists()` and `sequential:` / `parallel:` were all rejected,
 // long after each was implemented. A grammar kept in a comment beside its parser
@@ -3222,6 +3222,29 @@ fn compile_apl_blocks(source: &str, raw: RouteYaml) -> Result<CompiledRoute, Par
         }
     }
     route.plugin_overrides = raw.plugins;
+
+    // Elicitations within a phase share one id. Cross-layer duplicates are
+    // checked again by the visitor after route stacking.
+    for (phase, effects) in [
+        ("pre_invocation", &route.pre_invocation),
+        ("post_invocation", &route.post_invocation),
+    ] {
+        let elicits: usize = effects
+            .iter()
+            .map(crate::rules::Effect::count_elicits)
+            .sum();
+        if elicits > 1 {
+            return Err(ParseError::Rule {
+                rule: format!("{source}.{phase}"),
+                msg: format!(
+                    "{phase} reaches {elicits} elicitation steps; at most one elicitation per \
+                     phase is supported (they would share one retry id and resolve against \
+                     each other)"
+                ),
+            });
+        }
+    }
+
     Ok(route)
 }
 
@@ -4715,6 +4738,63 @@ route:
         let err = compile_test_policy("r", yaml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("result.x"), "expected result.x in: {msg}");
+    }
+
+    #[test]
+    fn two_elicit_steps_in_one_phase_rejected() {
+        let yaml = r#"
+route:
+  authorization:
+    pre_invocation:
+      - "confirm(approver, from: user.sub)"
+      - "require_approval(approver, from: user.manager)"
+"#;
+        let err = compile_test_policy("payroll", yaml)
+            .expect_err("two elicits in one phase must be rejected");
+        assert!(
+            format!("{err}").contains("at most one elicitation per phase"),
+            "expected a multi-elicit rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn single_elicit_per_phase_compiles() {
+        let yaml = r#"
+route:
+  authorization:
+    pre_invocation:
+      - "require_approval(approver, from: user.manager)"
+    post_invocation:
+      - "confirm(auditor, from: user.sub)"
+"#;
+        compile_test_policy("payroll", yaml).expect("one elicit per phase must compile");
+    }
+
+    #[test]
+    fn duplicate_field_pipeline_key_is_rejected_not_last_wins() {
+        // Pin duplicate-key rejection: last-wins parsing could drop a redaction.
+        let yaml = r#"
+route:
+  result:
+    ssn: "redact"
+    ssn: "hash"
+"#;
+        let err = compile_test_policy("r", yaml).expect_err("a repeated field key is not legal");
+        assert!(
+            format!("{err}").contains("duplicate entry with key"),
+            "expected a duplicate-key error, got {err}"
+        );
+    }
+
+    #[test]
+    fn distinct_field_pipeline_keys_still_load() {
+        let yaml = r#"
+route:
+  result:
+    ssn: "redact"
+    email: "hash"
+"#;
+        compile_test_policy("r", yaml).expect("distinct field keys are legal");
     }
 
     #[test]

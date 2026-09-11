@@ -223,3 +223,41 @@ fn an_attribute_file_that_does_not_exist_is_rejected() {
 fn an_empty_attribute_files_list_loads() {
     loads("global:\n  attribute_files: []\n");
 }
+
+/// Cross-layer elicitations in one phase are rejected after route stacking.
+#[test]
+fn a_global_and_route_elicit_in_one_phase_is_rejected() {
+    let e = load_err(
+        r#"global:
+  authorization:
+    pre_invocation:
+      - "require_approval(manager-approver, from: user.manager)"
+routes:
+  - tool: get_compensation
+    authorization:
+      pre_invocation:
+        - "confirm(user-confirm, from: user.sub)"
+"#,
+    );
+    assert!(
+        e.contains("at most one elicitation per phase"),
+        "a global plus route elicit stacked into one phase must be rejected: {e}"
+    );
+}
+
+/// Elicitations in separate phases remain valid.
+#[test]
+fn a_global_pre_elicit_and_route_post_elicit_load() {
+    loads(
+        r#"global:
+  authorization:
+    pre_invocation:
+      - "require_approval(manager-approver, from: user.manager)"
+routes:
+  - tool: get_compensation
+    authorization:
+      post_invocation:
+        - "confirm(user-confirm, from: user.sub)"
+"#,
+    );
+}

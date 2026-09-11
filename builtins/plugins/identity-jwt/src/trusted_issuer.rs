@@ -144,9 +144,15 @@ pub struct TrustedIssuer {
     pub issuer: String,
 
     /// Expected audience(s). Tokens must carry at least one matching
-    /// `aud` value. Empty vec means "don't check audience"
-    /// (only acceptable for trusted-internal flows).
+    /// `aud` value. Empty vec disables audience checking only when
+    /// [`skip_audience_validation`](Self::skip_audience_validation) is set.
     pub audiences: Vec<String>,
+
+    /// When true, `aud` is not checked. Produced only from config that
+    /// set `skip_audience_validation: true`. An empty `audiences` list
+    /// without this flag is refused at load, and at verify it rejects
+    /// the token rather than treating any audience as acceptable.
+    pub skip_audience_validation: bool,
 
     /// Decoding keys for this issuer, indexed by `kid`. For inline
     /// sources (Pem/Jwk/Secret) this is a single-entry store with
@@ -357,6 +363,7 @@ impl std::fmt::Debug for TrustedIssuer {
         f.debug_struct("TrustedIssuer")
             .field("issuer", &self.issuer)
             .field("audiences", &self.audiences)
+            .field("skip_audience_validation", &self.skip_audience_validation)
             .field("algorithms", &self.algorithms)
             .field("leeway_seconds", &self.leeway_seconds)
             .field("keys", &self.keys)

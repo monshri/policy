@@ -128,16 +128,16 @@ impl SessionStore for ValkeySessionStore {
         // closed. A persistently-failing refresh risks silent key
         // expiry across requests — see the operator runbook.
         if let Some(ttl) = self.ttl_seconds {
-            let refresh: Result<bool, _> = match tokio::time::timeout(
-                self.command_timeout,
-                conn.expire(&key, ttl_for_expire(ttl)),
-            )
-            .await
-            {
-                Ok(res) => res,
-                Err(_) => Ok(false), // treat timeout as a failed refresh
+            // Timeouts raise the same refresh-failure alarm as backend errors.
+            let refresh: Result<Result<bool, _>, _> =
+                tokio::time::timeout(self.command_timeout, conn.expire(&key, ttl_for_expire(ttl)))
+                    .await;
+            let refresh_error: Option<String> = match refresh {
+                Ok(Ok(_)) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(_) => Some("EXPIRE timed out".to_owned()),
             };
-            if let Err(e) = refresh {
+            if let Some(e) = refresh_error {
                 tracing::warn!(
                     alarm = "session_store_ttl_refresh_failed",
                     error = %e,

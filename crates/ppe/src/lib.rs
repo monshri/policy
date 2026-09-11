@@ -241,6 +241,13 @@ pub use http_hyper::HyperTransport;
 /// The transport builds its pool on first use, so calling this from a
 /// short-lived initialization runtime is safe.
 ///
+/// Destinations in the shared address table — loopback, RFC 1918,
+/// link-local (including cloud metadata), CGNAT — are refused as
+/// [`praxis_policy_core::http::HttpTransportError::Rejected`], including
+/// a hostname that resolves only to those addresses. A local `IdP` needs
+/// [`HyperTransport::with_allow_private_destinations`] installed via
+/// [`PolicyEngine::set_http_transport`] instead of this helper.
+///
 /// Returns `false` if a transport was already installed, in which case
 /// the existing one is kept.
 #[cfg(feature = "http-hyper")]

@@ -78,11 +78,14 @@ valkey = ["_builtin", "dep:praxis-policy-session-valkey"]
 http-hyper = [
     "dep:hyper-util",
     "dep:hyper-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
     "dep:http-body-util",
     "dep:bytes",
     "dep:http",
     "dep:async-trait",
     "dep:tokio",
+    "dep:tower-service",
 ]
 
 # Private marker meaning "at least one builtin is enabled", which is what gates
@@ -136,6 +139,13 @@ hyper-rustls = { version = "0.27", optional = true, default-features = false, fe
     "tls12",
     "webpki-roots",
 ] }
+# Direct dependencies let the transport select `ring` without reading or setting
+# rustls's process-wide default provider.
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+webpki-roots = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 bytes = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
@@ -145,6 +155,8 @@ async-trait = { workspace = true, optional = true }
 # default features. The transport spawns nothing and runs on whatever
 # runtime the host is already using.
 tokio = { workspace = true, optional = true }
+# `Service<Name>` for the DNS resolver that drops private addresses.
+tower-service = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
@@ -154,6 +166,10 @@ mockito = "1"
 # Test-only: `every_builtin_pdp_kind_is_in_the_differential_harness` imports
 # `HARNESS_PDP_KINDS` from here so the facade cannot drift from the harness.
 praxis-policy-pdp-diff = { path = "../ppe-pdp-diff" }
+# Test-only: `docs_examples` reads an attribute-file example as YAML before
+# handing it to the merge the runtime uses.
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

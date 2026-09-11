@@ -298,7 +298,8 @@ async fn happy_path_mints_delegated_token() {
 
 /// `IdP` returns a 400 with the standard `error` / `error_description`
 /// shape — delegator surfaces `delegation.idp_rejected` carrying the
-/// `IdP`'s machine-readable code.
+/// `IdP`'s machine-readable code. The free-text description is not
+/// forwarded: an `IdP` may echo the submitted `subject_token` there.
 #[tokio::test]
 async fn idp_rejection_surfaces_error_code() {
     let http = idp(
@@ -323,8 +324,8 @@ async fn idp_rejection_surfaces_error_code() {
         violation.reason,
     );
     assert!(
-        violation.reason.contains("not active"),
-        "reason should include the error_description; got: {}",
+        !violation.reason.contains("not active"),
+        "error_description is free text and is not forwarded: {}",
         violation.reason,
     );
 }
@@ -877,20 +878,17 @@ async fn a_leg1_success_that_is_not_a_token_response_denies() {
 // Leg-2 error shapes
 // =====================================================================
 
-/// A leg-2 rejection carrying `error_description` surfaces both the code and
-/// the description.
-///
-/// Note the asymmetry with leg 1, which deliberately drops the description
-/// because an `IdP` may echo the submitted credential back in it. Leg 2 submits
-/// the caller's bearer token as `subject_token`, so the same echo is possible
-/// here. This test records what the code does today rather than endorsing it.
+/// A leg-2 rejection carrying `error_description` must not surface the
+/// description. Leg 2 submits the caller's bearer as `subject_token`, and
+/// an `IdP` may echo that credential back in the description — the same
+/// reason leg 1 drops it.
 #[tokio::test]
-async fn a_leg2_rejection_surfaces_the_error_description() {
+async fn a_leg2_rejection_does_not_leak_error_description() {
     let http = idp(
         400,
         &json!({
             "error": "invalid_scope",
-            "error_description": "read:compensation is not granted to this client",
+            "error_description": "subject_token eyJhbGciOiJnone.echoed.token is not granted",
         })
         .to_string(),
     );
@@ -911,17 +909,24 @@ async fn a_leg2_rejection_surfaces_the_error_description() {
         violation.reason
     );
     assert!(
-        violation.reason.contains("not granted to this client"),
-        "and today the description is appended to it: {}",
+        !violation.reason.contains("eyJhbGciOiJnone"),
+        "an IdP that echoes the subject_token in error_description must \
+         not put it on the violation: {}",
+        violation.reason
+    );
+    assert!(
+        !violation.reason.contains("not granted"),
+        "error_description is free text and is not forwarded: {}",
         violation.reason
     );
 }
 
 /// A leg-2 rejection whose body is not OAuth error JSON falls back to the
-/// status. Without the fallback the violation would carry an empty reason.
+/// status. The raw body is not forwarded: it can echo the `subject_token`
+/// the same way `error_description` can.
 #[tokio::test]
 async fn a_leg2_rejection_with_an_unparseable_body_falls_back_to_the_status() {
-    let http = idp(500, "upstream exploded");
+    let http = idp(500, "upstream exploded; subject_token=eyJhbGciOiJnone");
 
     let violation = violation_for(
         build_payload("get_compensation", "https://hr.example.com", &[]),
@@ -932,6 +937,16 @@ async fn a_leg2_rejection_with_an_unparseable_body_falls_back_to_the_status() {
     assert!(
         violation.reason.contains("500"),
         "the status must appear when nothing else is parseable: {}",
+        violation.reason
+    );
+    assert!(
+        !violation.reason.contains("upstream exploded"),
+        "the raw body is not forwarded: {}",
+        violation.reason
+    );
+    assert!(
+        !violation.reason.contains("eyJhbGciOiJnone"),
+        "a body that echoes the subject_token must not land on the violation: {}",
         violation.reason
     );
 }

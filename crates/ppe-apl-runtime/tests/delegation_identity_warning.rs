@@ -26,11 +26,34 @@
 use std::sync::{Arc, Mutex};
 
 use praxis_policy_core::engine::PolicyEngine;
+use praxis_policy_core::error::PluginError;
+use praxis_policy_core::factory::{PluginFactory, PluginInstance};
+use praxis_policy_core::plugin::{Plugin, PluginConfig};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
 const ALARM: &str = "delegation_without_identity_resolution";
+
+/// Declares the identity plugin used by the configuration fixture.
+struct Inert(PluginConfig);
+
+impl Plugin for Inert {
+    fn config(&self) -> &PluginConfig {
+        &self.0
+    }
+}
+
+struct InertFactory;
+
+impl PluginFactory for InertFactory {
+    fn create(&self, config: &PluginConfig) -> Result<PluginInstance, Box<PluginError>> {
+        Ok(PluginInstance {
+            plugin: Arc::new(Inert(config.clone())),
+            handlers: Vec::new(),
+        })
+    }
+}
 
 /// A route delegating the caller's credential, with nothing configured
 /// to validate it.
@@ -50,7 +73,10 @@ routes:
 const WITH_IDENTITY: &str = r#"
 engine_settings:
   dispatch: policy
-plugins: []
+plugins:
+  - name: corp-jwt
+    kind: builtin
+    hooks: [identity.resolve]
 routes:
   - tool: get_compensation
     authentication:
@@ -136,6 +162,7 @@ fn alarms_raised_by_loading(yaml: &str) -> Vec<String> {
     };
 
     let mgr = Arc::new(PolicyEngine::default());
+    mgr.register_factory("builtin", Box::new(InertFactory));
     praxis_policy_apl_runtime::register_apl(
         &mgr,
         praxis_policy_apl_runtime::AplOptions::in_process(),

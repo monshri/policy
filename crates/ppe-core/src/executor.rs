@@ -491,10 +491,15 @@ impl Executor {
             match result {
                 Ok(Ok(result_box)) => {
                     if let Some(erased) = extract_erased(result_box) {
-                        if !erased.continue_processing
-                            && can_block
-                            && let Some(mut v) = erased.violation
-                        {
+                        if !erased.continue_processing && can_block {
+                            // A blocking result always halts; synthesize a violation
+                            // when the plugin did not provide one.
+                            let mut v = erased.violation.unwrap_or_else(|| {
+                                crate::error::PluginViolation::new(
+                                    "plugin_deny",
+                                    format!("Plugin '{plugin_name}' denied"),
+                                )
+                            });
                             v.plugin_name = Some(plugin_name.to_owned());
                             return Some(v);
                         }
@@ -599,8 +604,45 @@ impl Executor {
 
                         // Plugin writes to ctx.global_state are committed back
                         // to the canonical store via store_context() below.
+                    } else {
+                        // A handler that boxed the wrong type used to be
+                        // treated as Allow. An unreadable result is an
+                        // execution error: Fail halts, Ignore/Disable are
+                        // the documented knobs.
+                        error!(
+                            "{} plugin '{}' returned unexpected result type",
+                            phase_label, plugin_name
+                        );
+                        let e = crate::error::PluginError::Execution {
+                            plugin_name: plugin_name.to_owned(),
+                            message: "handler returned unexpected result type".into(),
+                            source: None,
+                            code: None,
+                            details: std::collections::HashMap::new(),
+                            proto_error_code: None,
+                        };
+                        match on_error {
+                            OnError::Fail if can_block => {
+                                let mut v = crate::error::PluginViolation::new(
+                                    "plugin_error",
+                                    format!("Plugin '{plugin_name}' failed: {e}"),
+                                );
+                                v.plugin_name = Some(plugin_name.to_owned());
+                                return Some(v);
+                            },
+                            OnError::Fail => {
+                                errors.push((&e).into());
+                            },
+                            OnError::Ignore => {
+                                errors.push((&e).into());
+                            },
+                            OnError::Disable => {
+                                errors.push((&e).into());
+                                entry.plugin_ref.disable();
+                            },
+                        }
                     }
-                    // If extract failed or no modifications — payload unchanged
+                    // If no modifications — payload unchanged
                 },
                 Ok(Err(e)) => {
                     error!("{} plugin '{}' failed: {}", phase_label, plugin_name, e);
@@ -853,10 +895,15 @@ impl Executor {
                             });
                             BranchData::Deny(violation)
                         },
-                        // `Some(..)` with continue_processing=true, OR
-                        // `None` (downcast failed — historically logged
-                        // and treated as Allow) both fall through.
-                        _ => BranchData::Allow,
+                        Some(_) => BranchData::Allow,
+                        None => BranchData::Error(Box::new(PluginError::Execution {
+                            plugin_name,
+                            message: "handler returned unexpected result type".into(),
+                            source: None,
+                            code: None,
+                            details: std::collections::HashMap::new(),
+                            proto_error_code: None,
+                        })),
                     },
                     Err(e) => BranchData::Error(e),
                 }
@@ -1132,7 +1179,9 @@ pub struct ErasedResultFields {
 ///
 /// Takes ownership of the Box — the executor consumes the result.
 /// Logs a warning if the downcast fails (indicates a handler returned
-/// the wrong type — a framework bug, not a plugin error).
+/// the wrong type — a framework bug, not a plugin error). Callers treat
+/// `None` as an execution error so a deny that cannot be read cannot
+/// become Allow.
 pub fn extract_erased(result: Box<dyn Any + Send + Sync>) -> Option<ErasedResultFields> {
     if let Ok(b) = result.downcast::<ErasedResultFields>() {
         Some(*b)
@@ -1305,6 +1354,8 @@ mod tests {
         Hang,
         Panic,
         None,
+        /// Boxed the wrong `Any` type, so [`extract_erased`] returns None.
+        WrongType,
     }
 
     struct MockPlugin(PluginConfig);
@@ -1343,6 +1394,7 @@ mod tests {
                 },
                 Failure::Panic => panic!("simulated panic inside a branch"),
                 Failure::None => Ok(erase_result(PluginResult::<TestPayload>::allow())),
+                Failure::WrongType => Ok(Box::new(0_u8)),
             }
         }
 
@@ -1398,6 +1450,70 @@ mod tests {
         assert!(r.continue_processing, "no failure, so no halt");
         assert!(r.errors.is_empty(), "and nothing to report");
         assert!(!entry.plugin_ref.is_disabled());
+    }
+
+    /// A handler that boxed the wrong type used to be treated as Allow,
+    /// so a deny that could not be read was dropped. Fail-closed: the
+    /// unreadable result is an execution error and `on_error: fail`
+    /// halts.
+    #[tokio::test]
+    async fn a_concurrent_unreadable_result_under_fail_is_fail_closed() {
+        let (r, _) = run_one(Failure::WrongType, OnError::Fail).await;
+        assert!(!r.continue_processing, "an unreadable result must halt");
+        let v = r.violation.expect("a violation is required to halt");
+        assert_eq!(v.code, "plugin_error");
+        assert_eq!(v.plugin_name.as_deref(), Some("mock"));
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_unreadable_result_under_ignore_continues() {
+        let (r, entry) = run_one(Failure::WrongType, OnError::Ignore).await;
+        assert!(
+            r.continue_processing,
+            "on_error: ignore is the documented hatch"
+        );
+        assert_eq!(r.errors.len(), 1);
+        assert!(!entry.plugin_ref.is_disabled());
+    }
+
+    fn serial_entry(name: &str, on_error: OnError, failure: Failure) -> HookEntry {
+        let cfg = PluginConfig {
+            name: name.into(),
+            mode: PluginMode::Sequential,
+            on_error,
+            ..Default::default()
+        };
+        HookEntry {
+            plugin_ref: Arc::new(PluginRef::new(
+                Arc::new(MockPlugin(cfg.clone())),
+                cfg.clone(),
+            )),
+            handler: Arc::new(MockHandler(failure)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_serial_unreadable_result_under_fail_is_fail_closed() {
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 1,
+            short_circuit_on_deny: true,
+        });
+        let entry = serial_entry("mock", OnError::Fail, Failure::WrongType);
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(TestPayload { value: "x".into() });
+        let (r, _bg) = executor
+            .execute(
+                std::slice::from_ref(&entry),
+                payload,
+                Extensions::default(),
+                None,
+                &tracker,
+            )
+            .await;
+        assert!(!r.continue_processing, "an unreadable result must halt");
+        let v = r.violation.expect("a violation is required to halt");
+        assert_eq!(v.code, "plugin_error");
+        assert_eq!(v.plugin_name.as_deref(), Some("mock"));
     }
 
     // ---- returned error ---------------------------------------------------

@@ -389,11 +389,11 @@ struct TokenExchangeResponse {
 
 /// Subset of the standard OAuth error response — `error` is the
 /// machine-readable code (`invalid_grant`, `invalid_scope`, …).
+/// `error_description` is not modelled: an `IdP` may echo the submitted
+/// credential there, and serde drops unmodelled fields.
 #[derive(Debug, Deserialize)]
 struct TokenErrorResponse {
     error: String,
-    #[serde(default)]
-    error_description: Option<String>,
 }
 
 #[async_trait]
@@ -519,24 +519,16 @@ impl OAuthDelegator {
 
         let status = response.status;
         if !response.is_success() {
-            // Try to surface the standard `error` / `error_description`
-            // fields from the IdP. Fall back to status code.
             let body = String::from_utf8_lossy(&response.body).into_owned();
-            let (code, reason) = match serde_json::from_str::<TokenErrorResponse>(&body) {
-                Ok(err) => {
-                    let mut reason = err.error.clone();
-                    if let Some(desc) = err.error_description {
-                        reason.push_str(": ");
-                        reason.push_str(&desc);
-                    }
-                    ("delegation.idp_rejected", reason)
-                },
-                Err(_) => (
-                    "delegation.idp_rejected",
-                    format!("IdP returned {status}: {body}"),
-                ),
+            // Same sanitization as leg 1: the OAuth `error` CODE only,
+            // never `error_description` or the raw body. Leg 2 submits
+            // the caller's bearer as `subject_token`, and an IdP may
+            // echo that credential back in those fields.
+            let reason = match serde_json::from_str::<TokenErrorResponse>(&body) {
+                Ok(err) => format!("token exchange rejected: {}", err.error),
+                Err(_) => format!("token exchange rejected (HTTP {status})"),
             };
-            return Err(PluginViolation::new(code, reason));
+            return Err(PluginViolation::new("delegation.idp_rejected", reason));
         }
 
         let parsed = match serde_json::from_slice::<TokenExchangeResponse>(&response.body) {

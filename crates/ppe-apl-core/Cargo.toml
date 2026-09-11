@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Praxis Contributors
 
 # APL core — predicate language, compiler, evaluator.
-# The grammar this crate accepts is normative in docs/apl-grammar.md.
+# The grammar this crate accepts is normative in docs/content/apl/apl-grammar.md.
 
 [package]
 name = "praxis-policy-apl-core"
@@ -54,7 +54,13 @@ test-util = []
 
 [dev-dependencies]
 tokio = { workspace = true }
-praxis-policy-apl-core = { workspace = true, features = ["test-util"] }
+# Path-only rather than `workspace = true`, because the workspace entry carries a
+# version requirement and a self dev-dependency cannot satisfy one: at package
+# time cargo resolves the requirement against the registry, where this version
+# does not exist yet, so `cargo package` fails before anything is uploaded.
+# Cargo drops a dev-dependency that names no version from the published manifest,
+# which is correct here: no consumer builds this crate's tests.
+praxis-policy-apl-core = { path = ".", features = ["test-util"] }
 
 [lints]
 workspace = true
