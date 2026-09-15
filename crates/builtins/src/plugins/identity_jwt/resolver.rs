@@ -34,6 +34,7 @@
 // Stable codes for runtime denials:
 //
 //   * `auth.malformed_header` — JWT structure wrong / empty token
+//   * `auth.malformed_credential` — cookie or query-param parse failure
 //   * `auth.untrusted_issuer` — `iss` not in trusted list
 //   * `auth.signature_invalid` — signature failed
 //   * `auth.token_expired` — `exp` in the past
@@ -794,7 +795,7 @@ impl JwtIdentityResolver {
                             "auth.ambiguous_credential",
                             format!("duplicate cookie name '{name}'"),
                         ),
-                        other => PluginViolation::new("auth.malformed_header", other.to_string()),
+                        other => PluginViolation::new("auth.malformed_credential", other.to_string()),
                     })
                         })?;
                 match cookies.get(name) {
@@ -830,7 +831,7 @@ impl JwtIdentityResolver {
                                 format!("duplicate query parameter name '{name}'"),
                             ),
                             other => {
-                                PluginViolation::new("auth.malformed_header", other.to_string())
+                                PluginViolation::new("auth.malformed_credential", other.to_string())
                             },
                         })
                     })?;
@@ -2041,7 +2042,7 @@ mod tests {
         let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
         assert_eq!(
             deny_code_for(&resolver, payload).await,
-            "auth.malformed_header"
+            "auth.malformed_credential"
         );
     }
 
@@ -2059,7 +2060,7 @@ mod tests {
         let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
         assert_eq!(
             deny_code_for(&resolver, payload).await,
-            "auth.malformed_header"
+            "auth.malformed_credential"
         );
     }
 
@@ -2130,7 +2131,7 @@ mod tests {
             IdentityPayload::new("", TokenSource::Bearer).with_raw_query_string(oversized);
         assert_eq!(
             deny_code_for(&resolver, payload).await,
-            "auth.malformed_header"
+            "auth.malformed_credential"
         );
     }
 
