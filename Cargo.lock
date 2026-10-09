@@ -2872,6 +2872,66 @@ dependencies = [
 ]
 
 [[package]]
+name = "praxis-policy-test-utils"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "jsonwebtoken",
+ "praxis-policy",
+ "praxis-policy-core",
+ "praxis-policy-plugin-audit-logger",
+ "praxis-policy-plugin-pii-scanner",
+ "rand 0.8.8",
+ "rsa",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "yaml_serde",
+]
+
+[[package]]
+name = "praxis-policy-tests-integration"
+version = "0.4.1"
+dependencies = [
+ "praxis-policy",
+ "praxis-policy-core",
+ "praxis-policy-plugin-audit-logger",
+ "praxis-policy-plugin-pii-scanner",
+ "praxis-policy-test-utils",
+ "serde_json",
+ "tokio",
+ "yaml_serde",
+]
+
+[[package]]
+name = "praxis-policy-tests-resilience"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "praxis-policy",
+ "praxis-policy-core",
+ "praxis-policy-test-utils",
+ "serde_json",
+ "tokio",
+ "yaml_serde",
+]
+
+[[package]]
+name = "praxis-policy-tests-security"
+version = "0.4.1"
+dependencies = [
+ "praxis-policy",
+ "praxis-policy-core",
+ "praxis-policy-test-utils",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

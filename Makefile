@@ -40,6 +40,9 @@ help:
 	@echo ""
 	@echo "Test:"
 	@echo "  test              Run all workspace tests"
+	@echo "  test-integration  Integration, resilience and security suites"
+	@echo "  test-resilience   Resilience suite (dependency failure, concurrency)"
+	@echo "  test-security     Security suite (adversarial inputs)"
 	@echo "  test-tsan         Engine concurrency stress under ThreadSanitizer (nightly)"
 	@echo "  bench-pdp-cache   PDP decision-cache hit vs miss (on demand, not CI)"
 	@echo ""
@@ -174,6 +177,24 @@ setup-hooks:
 test:
 	@$(CARGO) test --workspace
 	@$(CARGO) test --workspace --all-features
+
+# The suites under tests/. They build only with `--all-features`, which turns on
+# their `suite` feature; `make test` runs them in its second pass. As in praxis,
+# test-integration runs all three.
+.PHONY: test-integration
+test-integration:
+	@$(CARGO) test --all-features \
+		-p praxis-policy-tests-integration \
+		-p praxis-policy-tests-resilience \
+		-p praxis-policy-tests-security
+
+.PHONY: test-resilience
+test-resilience:
+	@$(CARGO) test --all-features -p praxis-policy-tests-resilience
+
+.PHONY: test-security
+test-security:
+	@$(CARGO) test --all-features -p praxis-policy-tests-security
 
 # ThreadSanitizer on the engine concurrency stress test. Needs nightly, a
 # Linux target, and an instrumented libstd (`-Zbuild-std`). The sanitizer
@@ -406,10 +427,10 @@ release: release-tool
 # checkout; --allow-dirty lets it run locally with work in progress.
 .PHONY: publish-dry
 publish-dry:
-	@$(CARGO) package --workspace --locked --allow-dirty
+	@$(CARGO) package --workspace --exclude praxis-policy-test-utils --locked --allow-dirty
 # Packaging with default features compiles none of the bundled extensions, so
 # the dry run would prove nothing about them.
-	@$(CARGO) package --workspace --locked --allow-dirty --all-features
+	@$(CARGO) package --workspace --exclude praxis-policy-test-utils --locked --allow-dirty --all-features
 
 # Tag the current commit and push it. The tag is what the release workflow
 # triggers on. VERSION must be semver with no leading `v`.
