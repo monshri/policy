@@ -88,7 +88,7 @@ use praxis_policy_core::config::{PolicyConfig, parse_config};
 use praxis_policy_core::context::PluginContext;
 use praxis_policy_core::error::{PluginError, PluginErrorRecord, PluginViolation};
 use praxis_policy_core::executor::{BackgroundTasks, PipelineResult};
-use praxis_policy_core::extensions::{Extensions, MetaExtension};
+use praxis_policy_core::extensions::{Credential, Extensions, MetaExtension};
 use praxis_policy_core::factory::{PluginFactory, PluginInstance};
 use praxis_policy_core::hooks::TypedHandlerAdapter;
 use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
@@ -427,9 +427,11 @@ fn attach_delegated_tokens(queued: &mut Queued, extensions: Option<&Extensions>)
     }
     if !attached.is_empty() {
         for inbound in raw.inbound_tokens.values() {
-            let name = inbound.source_header.to_ascii_lowercase();
-            if !attached.contains(&name) {
-                queued.remove.push(name);
+            if let Credential::Header { name } = &inbound.source {
+                let lower = name.to_ascii_lowercase();
+                if !attached.contains(&lower) {
+                    queued.remove.push(lower);
+                }
             }
         }
     }

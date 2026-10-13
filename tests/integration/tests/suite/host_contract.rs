@@ -147,7 +147,9 @@ plugins:
     capabilities: [perform_http]
     config:
       role: user
-      header: X-User-Token
+      credential:
+        kind: header
+        name: X-User-Token
       trusted_issuers:
         - issuer: "https://idp.test/realms/policy-demo"
           audiences: ["praxis-gateway"]
@@ -162,7 +164,9 @@ plugins:
     capabilities: [perform_http]
     config:
       role: client
-      header: Authorization
+      credential:
+        kind: header
+        name: Authorization
       trusted_issuers:
         - issuer: "https://idp.test/realms/policy-demo"
           audiences: ["praxis-gateway"]
