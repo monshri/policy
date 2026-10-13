@@ -107,8 +107,8 @@ pub enum TokenSource {
 ///
 /// `Debug` is hand-written rather than derived — see the impl below — so
 /// that `tracing::debug!(?payload)` and similar diagnostics never print
-/// `raw_token` or `raw_query_string`, either of which can carry a live
-/// bearer token in plaintext.
+/// `raw_token`, `raw_query_string`, or header values, any of which can
+/// carry a live bearer token in plaintext.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct IdentityPayload {
     /// Raw credential bytes. Cleared on drop via `Zeroizing`.
@@ -124,7 +124,9 @@ pub struct IdentityPayload {
     source_header: Option<String>,
 
     /// Full request headers — escape hatch for custom auth flows.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    /// Serde-skipped: headers may carry credentials and must not
+    /// appear in serialized output.
+    #[serde(skip)]
     headers: HashMap<String, String>,
 
     /// Raw query string from the request URL, without the leading
@@ -189,13 +191,23 @@ pub struct IdentityPayload {
     credential_declined: bool,
 }
 
+struct RedactedHeaders<'a>(&'a HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, "<redacted>")))
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for IdentityPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IdentityPayload")
             .field("raw_token", &"<redacted>")
             .field("source", &self.source)
             .field("source_header", &self.source_header)
-            .field("headers", &self.headers)
+            .field("headers", &RedactedHeaders(&self.headers))
             .field(
                 "raw_query_string",
                 &self.raw_query_string.as_ref().map(|_| "<redacted>"),
@@ -535,6 +547,84 @@ mod tests {
     }
 
     #[test]
+    fn debug_output_redacts_header_values() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_owned(),
+            "Bearer eyJ.secret.jwt".to_owned(),
+        );
+        headers.insert("cookie".to_owned(), "session=abc123".to_owned());
+        headers.insert("x-user-token".to_owned(), "custom-secret-token".to_owned());
+        headers.insert("content-type".to_owned(), "application/json".to_owned());
+        let p = IdentityPayload::new("tok", TokenSource::Bearer).with_headers(headers);
+        let debug = format!("{p:?}");
+        assert!(
+            !debug.contains("eyJ.secret.jwt"),
+            "authorization value leaked: {debug}"
+        );
+        assert!(!debug.contains("abc123"), "cookie value leaked: {debug}");
+        assert!(
+            !debug.contains("custom-secret-token"),
+            "x-user-token value leaked: {debug}"
+        );
+        assert!(
+            !debug.contains("application/json"),
+            "content-type value leaked: {debug}"
+        );
+        assert!(
+            debug.contains("authorization"),
+            "header name missing: {debug}"
+        );
+        assert!(debug.contains("cookie"), "header name missing: {debug}");
+        assert!(
+            debug.contains("x-user-token"),
+            "header name missing: {debug}"
+        );
+        assert!(
+            debug.contains("content-type"),
+            "header name missing: {debug}"
+        );
+        assert!(
+            debug.contains("<redacted>"),
+            "redaction placeholder missing: {debug}"
+        );
+    }
+
+    #[test]
+    fn headers_never_serialized() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_owned(), "Bearer secret-jwt".to_owned());
+        headers.insert("x-user-token".to_owned(), "custom-secret".to_owned());
+        let p = IdentityPayload::new("tok", TokenSource::Bearer).with_headers(headers);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(
+            !json.contains("secret-jwt"),
+            "authorization value leaked into serialized form: {json}"
+        );
+        assert!(
+            !json.contains("custom-secret"),
+            "x-user-token value leaked into serialized form: {json}"
+        );
+        assert!(
+            !json.contains("headers"),
+            "headers field should be skipped in serialization: {json}"
+        );
+    }
+
+    #[test]
+    fn headers_absent_after_deserialize_round_trip() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_owned(), "Bearer tok".to_owned());
+        let p = IdentityPayload::new("tok", TokenSource::Bearer).with_headers(headers);
+        let json = serde_json::to_string(&p).unwrap();
+        let restored: IdentityPayload = serde_json::from_str(&json).unwrap();
+        assert!(
+            restored.headers().is_empty(),
+            "headers is serde-skipped and must be empty after round-trip"
+        );
+    }
+
+    #[test]
     fn debug_output_shows_whether_raw_query_string_was_present() {
         // The redaction hides the value but keeps the Some/None shape visible,
         // so a reader can tell "a query string was supplied but its content is
@@ -575,8 +665,7 @@ mod tests {
 
     #[test]
     fn raw_query_string_empty_string_is_some_not_none() {
-        let p = IdentityPayload::new("tok", TokenSource::Bearer)
-            .with_raw_query_string("");
+        let p = IdentityPayload::new("tok", TokenSource::Bearer).with_raw_query_string("");
         assert_eq!(
             p.raw_query_string(),
             Some(""),

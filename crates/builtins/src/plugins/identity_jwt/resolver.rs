@@ -33,8 +33,9 @@
 // Runtime token rejections → `PluginResult::deny(PluginViolation::new(code, reason))`.
 // Stable codes for runtime denials:
 //
-//   * `auth.malformed_header` — JWT structure wrong / empty token
-//   * `auth.malformed_credential` — cookie or query-param parse failure
+//   * `auth.malformed_header` — JWT structure wrong / empty token (header credential)
+//   * `auth.malformed_credential` — cookie or query-param credential: parse
+//     failure or malformed JWT structure
 //   * `auth.untrusted_issuer` — `iss` not in trusted list
 //   * `auth.signature_invalid` — signature failed
 //   * `auth.token_expired` — `exp` in the past
@@ -369,15 +370,33 @@ fn validate_credential(credential: &Credential) -> Result<(), String> {
             if name.trim().is_empty() {
                 return Err("`credential: { kind: header }` name must be non-empty".to_owned());
             }
+            if name != name.trim() || name.contains(char::is_whitespace) {
+                return Err(format!(
+                    "`credential: {{ kind: header, name: '{name}' }}` \
+                     must not contain leading, trailing, or interior whitespace"
+                ));
+            }
         },
         Credential::QueryParam { name } => {
             if name.trim().is_empty() {
                 return Err("`credential: { kind: query_param }` name must be non-empty".to_owned());
             }
+            if name != name.trim() || name.contains(char::is_whitespace) {
+                return Err(format!(
+                    "`credential: {{ kind: query_param, name: '{name}' }}` \
+                     must not contain leading, trailing, or interior whitespace"
+                ));
+            }
         },
         Credential::Cookie { name } => {
             if name.trim().is_empty() {
                 return Err("`credential: { kind: cookie }` name must be non-empty".to_owned());
+            }
+            if name != name.trim() || name.contains(char::is_whitespace) {
+                return Err(format!(
+                    "`credential: {{ kind: cookie, name: '{name}' }}` \
+                     must not contain leading, trailing, or interior whitespace"
+                ));
             }
             if name.contains(['=', ';']) {
                 return Err(format!(
@@ -385,9 +404,6 @@ fn validate_credential(credential: &Credential) -> Result<(), String> {
                 ));
             }
         },
-        // `Credential` is `#[non_exhaustive]`; a future variant this
-        // resolver doesn't yet know how to extract is a config error
-        // rather than a silent no-op.
         _ => {
             return Err(format!(
                 "`credential: {{ kind: {credential} }}` is not supported"
@@ -747,23 +763,38 @@ impl JwtIdentityResolver {
     fn extract_token(&self, payload: &IdentityPayload) -> Result<String, Box<PluginViolation>> {
         match &self.credential {
             Credential::Header { name } => {
-                // HTTP headers are case-insensitive (RFC 7230 §3.2); we
-                // lowercase the configured name to match the canonical
-                // form hosts use when populating the map. Fall back to
+                // HTTP headers are case-insensitive (RFC 7230 §3.2).
+                // Scan the map case-insensitively to handle hosts that
+                // may use any capitalisation. Reject ambiguous duplicate
+                // keys (multiple casings of the same name). Fall back to
                 // `payload.raw_token()` only when no header map is
                 // populated — covers single-resolver back-compat for
                 // hosts that still pre-extract one token.
                 let name_lc = name.to_ascii_lowercase();
-                let raw_token = match payload.headers().get(name_lc.as_str()) {
-                    Some(v) => strip_bearer_prefix(v).to_owned(),
-                    None if !payload.raw_token().is_empty() => payload.raw_token().to_owned(),
-                    None => {
+                let matches: Vec<&str> = payload
+                    .headers()
+                    .iter()
+                    .filter(|(k, _)| k.eq_ignore_ascii_case(&name_lc))
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                let raw_token = match matches.as_slice() {
+                    [single] => strip_bearer_prefix(single).to_owned(),
+                    [] if payload.headers().is_empty() && !payload.raw_token().is_empty() => {
+                        payload.raw_token().to_owned()
+                    },
+                    [] => {
                         return Err(Box::new(PluginViolation::new(
                             "auth.malformed_header",
                             format!(
                                 "{} missing from request (resolver '{}' / role '{:?}')",
                                 self.credential, self.cfg.name, self.role
                             ),
+                        )));
+                    },
+                    _ => {
+                        return Err(Box::new(PluginViolation::new(
+                            "auth.ambiguous_credential",
+                            format!("multiple headers matching '{name}' with different casing"),
                         )));
                     },
                 };
@@ -776,29 +807,49 @@ impl JwtIdentityResolver {
                 Ok(raw_token)
             },
             Credential::Cookie { name } => {
-                let cookie_header = payload.headers().get("cookie").ok_or_else(|| {
-                    Box::new(PluginViolation::new(
-                        "auth.missing_credential",
-                        format!(
-                            "no Cookie header in request (resolver '{}' expects {})",
-                            self.cfg.name, self.credential
-                        ),
-                    ))
-                })?;
-                let cookies =
-                    praxis_policy_core::http_credential::parse_cookie_header(cookie_header)
-                        .map_err(|e| {
-                            Box::new(match e {
-                        praxis_policy_core::http_credential::CredentialParseError::Duplicate {
-                            name,
-                            ..
-                        } => PluginViolation::new(
+                let cookie_values: Vec<&str> = payload
+                    .headers()
+                    .iter()
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                let cookie_header = match cookie_values.as_slice() {
+                    [] => {
+                        return Err(Box::new(PluginViolation::new(
+                            "auth.missing_credential",
+                            format!(
+                                "no Cookie header in request (resolver '{}' expects {})",
+                                self.cfg.name, self.credential
+                            ),
+                        )));
+                    },
+                    [single] => single,
+                    _ => {
+                        return Err(Box::new(PluginViolation::new(
                             "auth.ambiguous_credential",
-                            format!("duplicate cookie name '{name}'"),
-                        ),
-                        other => PluginViolation::new("auth.malformed_credential", other.to_string()),
-                    })
-                        })?;
+                            "multiple Cookie headers with different casing",
+                        )));
+                    },
+                };
+                let cookies =
+                    praxis_policy_core::http_credential::parse_cookie_header(cookie_header, name)
+                        .map_err(|e| {
+                        Box::new(match e {
+                            praxis_policy_core::http_credential::CredentialParseError::Duplicate {
+                                name,
+                                ..
+                            } => PluginViolation::new(
+                                "auth.ambiguous_credential",
+                                format!("duplicate cookie name '{name}'"),
+                            ),
+                            other => {
+                                PluginViolation::new(
+                                    "auth.malformed_credential",
+                                    other.to_string(),
+                                )
+                            },
+                        })
+                    })?;
                 match cookies.get(name) {
                     None => Err(Box::new(PluginViolation::new(
                         "auth.missing_credential",
@@ -821,7 +872,7 @@ impl JwtIdentityResolver {
                         ),
                     ))
                 })?;
-                let params = praxis_policy_core::http_credential::parse_query_string(query)
+                let params = praxis_policy_core::http_credential::parse_query_string(query, name)
                     .map_err(|e| {
                         Box::new(match e {
                             praxis_policy_core::http_credential::CredentialParseError::Duplicate {
@@ -830,6 +881,17 @@ impl JwtIdentityResolver {
                             } => PluginViolation::new(
                                 "auth.ambiguous_credential",
                                 format!("duplicate query parameter name '{name}'"),
+                            ),
+                            praxis_policy_core::http_credential::CredentialParseError::PercentEncodedName {
+                                encoded,
+                                credential,
+                            } => PluginViolation::new(
+                                "auth.malformed_credential",
+                                format!(
+                                    "query parameter '{encoded}' matches credential \
+                                     '{credential}' only after percent-decoding; \
+                                     the request source must send the name literally"
+                                ),
                             ),
                             other => {
                                 PluginViolation::new("auth.malformed_credential", other.to_string())
@@ -876,7 +938,7 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
             Some(iss) => iss,
             None => {
                 return PluginResult::deny(PluginViolation::new(
-                    "auth.malformed_header",
+                    malformed_code(&self.credential),
                     "JWT not well-formed or missing `iss` claim",
                 ));
             },
@@ -1002,7 +1064,7 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
                 ));
             },
             Err(ValidateError::Jwt(e)) => {
-                let (code, reason) = classify_jwt_error(&e);
+                let (code, reason) = classify_jwt_error(&e, &self.credential);
                 return PluginResult::deny(PluginViolation::new(code, reason));
             },
         };
@@ -1264,8 +1326,18 @@ fn has_unsupported_critical_extensions(header: &jsonwebtoken::Header) -> bool {
     header.crit.as_ref().is_some_and(|crit| !crit.is_empty())
 }
 
+fn malformed_code(credential: &Credential) -> &'static str {
+    match credential {
+        Credential::Header { .. } => "auth.malformed_header",
+        _ => "auth.malformed_credential",
+    }
+}
+
 /// Map jsonwebtoken errors to stable violation codes.
-fn classify_jwt_error(e: &jsonwebtoken::errors::Error) -> (&'static str, String) {
+fn classify_jwt_error(
+    e: &jsonwebtoken::errors::Error,
+    credential: &Credential,
+) -> (&'static str, String) {
     use jsonwebtoken::errors::ErrorKind;
     let code = match e.kind() {
         ErrorKind::ExpiredSignature => "auth.token_expired",
@@ -1275,7 +1347,7 @@ fn classify_jwt_error(e: &jsonwebtoken::errors::Error) -> (&'static str, String)
         ErrorKind::MissingRequiredClaim(c) if c == "aud" => "auth.audience_mismatch",
         ErrorKind::InvalidIssuer => "auth.untrusted_issuer",
         ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => "auth.algorithm_mismatch",
-        ErrorKind::Base64(_) | ErrorKind::Json(_) => "auth.malformed_header",
+        ErrorKind::Base64(_) | ErrorKind::Json(_) => malformed_code(credential),
         _ => "auth.token_invalid",
     };
     (code, e.to_string())
@@ -1815,6 +1887,9 @@ mod tests {
     #[test]
     fn classify_picks_expected_codes() {
         use jsonwebtoken::errors::{Error, ErrorKind};
+        let header_cred = Credential::Header {
+            name: "authorization".into(),
+        };
         let cases = [
             (ErrorKind::ExpiredSignature, "auth.token_expired"),
             (ErrorKind::InvalidSignature, "auth.signature_invalid"),
@@ -1824,9 +1899,69 @@ mod tests {
         ];
         for (kind, expected_code) in cases {
             let err = Error::from(kind);
-            let (code, _reason) = classify_jwt_error(&err);
+            let (code, _reason) = classify_jwt_error(&err, &header_cred);
             assert_eq!(code, expected_code);
         }
+    }
+
+    #[test]
+    fn classify_jwt_error_uses_credential_aware_code_for_base64() {
+        use jsonwebtoken::errors::ErrorKind;
+        // Construct a JWT with an invalid base64 header segment, decode it
+        // to get a real Base64 error from jsonwebtoken's own dependency.
+        let bad_token = "!!!.payload.sig";
+        let key = jsonwebtoken::DecodingKey::from_secret(b"unused");
+        let validation = jsonwebtoken::Validation::default();
+        let base64_err = jsonwebtoken::decode::<std::collections::HashMap<String, String>>(
+            bad_token,
+            &key,
+            &validation,
+        )
+        .unwrap_err();
+        // Verify it's actually a Base64 error.
+        assert!(
+            matches!(base64_err.kind(), ErrorKind::Base64(_)),
+            "expected Base64 error, got: {base64_err:?}"
+        );
+        let (code, _) = classify_jwt_error(
+            &base64_err,
+            &Credential::Header {
+                name: "authorization".into(),
+            },
+        );
+        assert_eq!(code, "auth.malformed_header");
+        let (code, _) = classify_jwt_error(&base64_err, &Credential::Cookie { name: "jwt".into() });
+        assert_eq!(code, "auth.malformed_credential");
+        let (code, _) = classify_jwt_error(
+            &base64_err,
+            &Credential::QueryParam {
+                name: "token".into(),
+            },
+        );
+        assert_eq!(code, "auth.malformed_credential");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_jwt_from_a_cookie_reports_malformed_credential() {
+        let resolver = resolver_on_cookie("jwt");
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("cookie".to_owned(), "jwt=not-a-jwt".to_owned());
+        let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.malformed_credential",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_jwt_from_a_query_param_reports_malformed_credential() {
+        let resolver = resolver_on_query_param("token");
+        let payload =
+            IdentityPayload::new("", TokenSource::Bearer).with_raw_query_string("token=not-a-jwt");
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.malformed_credential",
+        );
     }
 
     // ---- where the token comes from ---------------------------------------
@@ -1948,6 +2083,182 @@ mod tests {
             deny_code_for(&resolver, payload).await,
             "auth.untrusted_issuer",
             "the fallback must supply the token rather than denying on the header"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_populated_header_map_without_the_configured_header_does_not_fall_back_to_raw_token()
+    {
+        let resolver = resolver_on_header("X-User-Token");
+        let token = jwt_with_payload(r#"{"iss":"https://nobody.example","sub":"alice"}"#);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("authorization".to_owned(), format!("Bearer {token}"));
+        let payload = IdentityPayload::new(token, TokenSource::Bearer).with_headers(headers);
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.malformed_header",
+            "with a populated header map the fallback must not fire"
+        );
+    }
+
+    // ---- credential-name whitespace validation ------------------------------
+
+    #[test]
+    fn credential_header_name_with_leading_whitespace_rejected() {
+        let cfg = cfg_with_config(
+            "jwt",
+            serde_json::json!({
+                "trusted_issuers": [{
+                    "issuer": "https://idp.example",
+                    "audiences": ["test-aud"],
+                    "algorithms": ["HS256"],
+                    "decoding_key": { "kind": "secret", "secret": "test-secret" },
+                }],
+                "credential": { "kind": "header", "name": " Authorization " },
+                "claim_mapper": "standard",
+            }),
+        );
+        let err = JwtIdentityResolver::new(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("whitespace"),
+            "expected whitespace error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn credential_header_name_with_interior_space_rejected() {
+        let cfg = cfg_with_config(
+            "jwt",
+            serde_json::json!({
+                "trusted_issuers": [{
+                    "issuer": "https://idp.example",
+                    "audiences": ["test-aud"],
+                    "algorithms": ["HS256"],
+                    "decoding_key": { "kind": "secret", "secret": "test-secret" },
+                }],
+                "credential": { "kind": "header", "name": "X User Token" },
+                "claim_mapper": "standard",
+            }),
+        );
+        let err = JwtIdentityResolver::new(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("whitespace"),
+            "expected whitespace error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn credential_cookie_name_with_whitespace_rejected() {
+        let cfg = cfg_with_config(
+            "jwt",
+            serde_json::json!({
+                "trusted_issuers": [{
+                    "issuer": "https://idp.example",
+                    "audiences": ["test-aud"],
+                    "algorithms": ["HS256"],
+                    "decoding_key": { "kind": "secret", "secret": "test-secret" },
+                }],
+                "credential": { "kind": "cookie", "name": " jwt " },
+                "claim_mapper": "standard",
+            }),
+        );
+        let err = JwtIdentityResolver::new(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("whitespace"),
+            "expected whitespace error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn credential_query_param_name_with_whitespace_rejected() {
+        let cfg = cfg_with_config(
+            "jwt",
+            serde_json::json!({
+                "trusted_issuers": [{
+                    "issuer": "https://idp.example",
+                    "audiences": ["test-aud"],
+                    "algorithms": ["HS256"],
+                    "decoding_key": { "kind": "secret", "secret": "test-secret" },
+                }],
+                "credential": { "kind": "query_param", "name": " token " },
+                "claim_mapper": "standard",
+            }),
+        );
+        let err = JwtIdentityResolver::new(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("whitespace"),
+            "expected whitespace error, got: {err}"
+        );
+    }
+
+    // ---- case-insensitive header lookup ------------------------------------
+
+    #[tokio::test]
+    async fn header_lookup_is_case_insensitive() {
+        let resolver = resolver_on_header("Authorization");
+        let token = jwt_with_payload(r#"{"iss":"https://nobody.example","sub":"alice"}"#);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("AUTHORIZATION".to_owned(), format!("Bearer {token}"));
+        let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.untrusted_issuer",
+            "case-insensitive lookup must find the header"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_headers_with_different_casing_rejected() {
+        let resolver = resolver_on_header("Authorization");
+        let token = jwt_with_payload(r#"{"iss":"https://nobody.example","sub":"alice"}"#);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("authorization".to_owned(), format!("Bearer {token}"));
+        headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
+        let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.ambiguous_credential",
+            "duplicate header keys with different casing must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn cookie_header_lookup_is_case_insensitive() {
+        let resolver = resolver_on_cookie("jwt");
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Cookie".to_owned(), "jwt=not-a-jwt".to_owned());
+        let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
+        let code = deny_code_for(&resolver, payload).await;
+        assert!(
+            code != "auth.missing_credential",
+            "case-insensitive Cookie lookup must find the header, got: {code}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cookie_header_mixed_case_lookup_works() {
+        let resolver = resolver_on_cookie("jwt");
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("COOKIE".to_owned(), "jwt=not-a-jwt".to_owned());
+        let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
+        let code = deny_code_for(&resolver, payload).await;
+        assert!(
+            code != "auth.missing_credential",
+            "COOKIE (all-caps) must be found, got: {code}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_cookie_headers_with_different_casing_rejected() {
+        let resolver = resolver_on_cookie("jwt");
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("cookie".to_owned(), "jwt=tok1".to_owned());
+        headers.insert("Cookie".to_owned(), "jwt=tok2".to_owned());
+        let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.ambiguous_credential",
+            "duplicate Cookie headers with different casing must be rejected"
         );
     }
 

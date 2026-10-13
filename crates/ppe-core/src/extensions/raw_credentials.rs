@@ -121,7 +121,7 @@ use zeroize::Zeroizing;
 /// downstream crates.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Credential {
     /// An HTTP header, e.g. `Authorization: Bearer <jwt>`.
     Header {
@@ -974,7 +974,13 @@ mod tests {
 
     #[test]
     fn debug_redacts_inbound_token() {
-        let tok = RawInboundToken::new("eyJ.SENSITIVE.jwt", "Authorization", TokenKind::Jwt);
+        let tok = RawInboundToken::new(
+            "eyJ.SENSITIVE.jwt",
+            Credential::Header {
+                name: "Authorization".into(),
+            },
+            TokenKind::Jwt,
+        );
         let debug = format!("{tok:?}");
         assert!(
             !debug.contains("SENSITIVE"),

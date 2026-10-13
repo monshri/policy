@@ -28,7 +28,7 @@
     reason = "test and example code"
 )]
 
-mod common;
+use crate::common;
 
 use common::{
     TEST_AUDIENCE, TEST_ISSUER, invoke, invoke_with_payload, mint_exact as mint_jwt, now_unix,
