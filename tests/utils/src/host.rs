@@ -421,11 +421,28 @@ fn attach_delegated_tokens(queued: &mut Queued, extensions: Option<&Extensions>)
     }
     if !attached.is_empty() {
         for inbound in raw.inbound_tokens.values() {
-            if let Credential::Header { name } = &inbound.source {
-                let lower = name.to_ascii_lowercase();
-                if !attached.contains(&lower) {
-                    queued.remove.push(lower);
-                }
+            match &inbound.source {
+                Credential::Header { name } => {
+                    let lower = name.to_ascii_lowercase();
+                    if !attached.contains(&lower) {
+                        queued.remove.push(lower);
+                    }
+                },
+                Credential::Cookie { .. } => {
+                    // Strip the entire Cookie header. Consistent with
+                    // the header path (which strips the whole
+                    // Authorization header, not just the bearer token).
+                    // The upstream gets a delegated identity, so the
+                    // user's original cookies should not be forwarded.
+                    if !queued.remove.contains(&"cookie".to_owned()) {
+                        queued.remove.push("cookie".to_owned());
+                    }
+                },
+                Credential::QueryParam { .. } => {
+                    // Query-param credentials live in the URL, not a
+                    // header — stripping requires host cooperation.
+                },
+                _ => {},
             }
         }
     }
@@ -1118,7 +1135,8 @@ impl RefHost {
 #[cfg(test)]
 mod tests {
     use praxis_policy_core::extensions::raw_credentials::{
-        DelegationKey, DelegationMode, RawCredentialsExtension, RawDelegatedToken,
+        DelegationKey, DelegationMode, RawCredentialsExtension, RawDelegatedToken, RawInboundToken,
+        TokenKind,
     };
 
     use super::*;
@@ -1158,6 +1176,42 @@ mod tests {
         assert_eq!(
             attach_value("X-API-Key", "", "api-secret"),
             [("x-api-key".to_owned(), "api-secret".to_owned())]
+        );
+    }
+
+    #[test]
+    fn cookie_credential_strips_entire_cookie_header() {
+        let mut raw = RawCredentialsExtension::default();
+        raw.delegated_tokens.insert(
+            DelegationKey::new(DelegationMode::OnBehalfOfUser, "api", Vec::new()),
+            RawDelegatedToken::new(
+                "delegated-secret",
+                "Authorization",
+                "api",
+                Vec::new(),
+                "2026-01-01T00:00:00Z".parse().expect("valid timestamp"),
+            ),
+        );
+        raw.inbound_tokens.insert(
+            praxis_policy_core::extensions::raw_credentials::TokenRole::User,
+            RawInboundToken::new(
+                "user-jwt",
+                Credential::Cookie {
+                    name: "__Host-jwt".into(),
+                },
+                TokenKind::Jwt,
+            ),
+        );
+        let extensions = Extensions {
+            raw_credentials: Some(Arc::new(raw)),
+            ..Default::default()
+        };
+        let mut queued = Queued::default();
+        attach_delegated_tokens(&mut queued, Some(&extensions));
+        assert!(
+            queued.remove.contains(&"cookie".to_owned()),
+            "cookie header should be queued for removal: {:?}",
+            queued.remove
         );
     }
 }

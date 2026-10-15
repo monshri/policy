@@ -305,7 +305,7 @@ impl fmt::Debug for RawInboundToken {
         f.debug_struct("RawInboundToken")
             .field("source", &self.source)
             .field("kind", &self.kind)
-            .field("token", &"<redacted>")
+            .field("token", &"[REDACTED]")
             .finish()
     }
 }
@@ -711,7 +711,7 @@ mod tests {
             "token leaked into Debug output: {debug}"
         );
         assert!(debug.contains("__Host-jwt"));
-        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

@@ -338,7 +338,7 @@ impl JwtIdentityResolver {
         // Flagging this at load time, once, gives the operator a chance to
         // notice and scrub it from their own logging before it ships.
         if matches!(credential, Credential::QueryParam { .. }) {
-            tracing::info!(
+            tracing::warn!(
                 plugin = %cfg.name,
                 "resolver '{}' configured for query_param credential — ensure infrastructure \
                  logs do not capture raw query strings",
@@ -365,50 +365,31 @@ impl JwtIdentityResolver {
 ///   `;` — either would make the configured name unparseable as a single
 ///   cookie name by `http_credential::parse_cookie_header`.
 fn validate_credential(credential: &Credential) -> Result<(), String> {
-    match credential {
-        Credential::Header { name } => {
-            if name.trim().is_empty() {
-                return Err("`credential: { kind: header }` name must be non-empty".to_owned());
-            }
-            if name != name.trim() || name.contains(char::is_whitespace) {
-                return Err(format!(
-                    "`credential: {{ kind: header, name: '{name}' }}` \
-                     must not contain leading, trailing, or interior whitespace"
-                ));
-            }
-        },
-        Credential::QueryParam { name } => {
-            if name.trim().is_empty() {
-                return Err("`credential: { kind: query_param }` name must be non-empty".to_owned());
-            }
-            if name != name.trim() || name.contains(char::is_whitespace) {
-                return Err(format!(
-                    "`credential: {{ kind: query_param, name: '{name}' }}` \
-                     must not contain leading, trailing, or interior whitespace"
-                ));
-            }
-        },
-        Credential::Cookie { name } => {
-            if name.trim().is_empty() {
-                return Err("`credential: { kind: cookie }` name must be non-empty".to_owned());
-            }
-            if name != name.trim() || name.contains(char::is_whitespace) {
-                return Err(format!(
-                    "`credential: {{ kind: cookie, name: '{name}' }}` \
-                     must not contain leading, trailing, or interior whitespace"
-                ));
-            }
-            if name.contains(['=', ';']) {
-                return Err(format!(
-                    "`credential: {{ kind: cookie, name: '{name}' }}` must not contain '=' or ';'"
-                ));
-            }
-        },
+    let (kind, name) = match credential {
+        Credential::Header { name } => ("header", name.as_str()),
+        Credential::QueryParam { name } => ("query_param", name.as_str()),
+        Credential::Cookie { name } => ("cookie", name.as_str()),
         _ => {
             return Err(format!(
                 "`credential: {{ kind: {credential} }}` is not supported"
             ));
         },
+    };
+    if name.trim().is_empty() {
+        return Err(format!(
+            "`credential: {{ kind: {kind} }}` name must be non-empty"
+        ));
+    }
+    if name != name.trim() || name.contains(char::is_whitespace) {
+        return Err(format!(
+            "`credential: {{ kind: {kind}, name: '{name}' }}` \
+             must not contain leading, trailing, or interior whitespace"
+        ));
+    }
+    if matches!(credential, Credential::Cookie { .. }) && name.contains(['=', ';']) {
+        return Err(format!(
+            "`credential: {{ kind: cookie, name: '{name}' }}` must not contain '=' or ';'"
+        ));
     }
     Ok(())
 }
@@ -749,6 +730,48 @@ impl JwtIdentityResolver {
     }
 }
 
+fn map_credential_parse_error(
+    e: praxis_policy_core::http_credential::CredentialParseError,
+) -> Box<PluginViolation> {
+    use praxis_policy_core::http_credential::CredentialParseError;
+    Box::new(match e {
+        CredentialParseError::Duplicate { name, .. } => PluginViolation::new(
+            "auth.ambiguous_credential",
+            format!("duplicate credential name '{name}'"),
+        ),
+        CredentialParseError::PercentEncodedName {
+            encoded,
+            credential,
+        } => PluginViolation::new(
+            "auth.malformed_credential",
+            format!(
+                "query parameter '{encoded}' matches credential \
+                 '{credential}' only after percent-decoding; \
+                 the request source must send the name literally"
+            ),
+        ),
+        other => PluginViolation::new("auth.malformed_credential", other.to_string()),
+    })
+}
+
+fn pick_from_parsed(
+    map: &std::collections::HashMap<String, String>,
+    name: &str,
+    credential: &Credential,
+) -> Result<String, Box<PluginViolation>> {
+    match map.get(name) {
+        None => Err(Box::new(PluginViolation::new(
+            "auth.missing_credential",
+            format!("{credential} not found in request"),
+        ))),
+        Some(v) if v.is_empty() => Err(Box::new(PluginViolation::new(
+            "auth.empty_credential",
+            format!("{credential} is present but empty"),
+        ))),
+        Some(v) => Ok(v.clone()),
+    }
+}
+
 impl JwtIdentityResolver {
     /// Extract the raw bearer token from wherever `self.credential` says it
     /// lives — an HTTP header, a `Cookie` header entry, or a query
@@ -833,34 +856,8 @@ impl JwtIdentityResolver {
                 };
                 let cookies =
                     praxis_policy_core::http_credential::parse_cookie_header(cookie_header, name)
-                        .map_err(|e| {
-                        Box::new(match e {
-                            praxis_policy_core::http_credential::CredentialParseError::Duplicate {
-                                name,
-                                ..
-                            } => PluginViolation::new(
-                                "auth.ambiguous_credential",
-                                format!("duplicate cookie name '{name}'"),
-                            ),
-                            other => {
-                                PluginViolation::new(
-                                    "auth.malformed_credential",
-                                    other.to_string(),
-                                )
-                            },
-                        })
-                    })?;
-                match cookies.get(name) {
-                    None => Err(Box::new(PluginViolation::new(
-                        "auth.missing_credential",
-                        format!("{} not found in request cookies", self.credential),
-                    ))),
-                    Some(v) if v.is_empty() => Err(Box::new(PluginViolation::new(
-                        "auth.empty_credential",
-                        format!("{} is present but empty", self.credential),
-                    ))),
-                    Some(v) => Ok(v.clone()),
-                }
+                        .map_err(map_credential_parse_error)?;
+                pick_from_parsed(&cookies, name, &self.credential)
             },
             Credential::QueryParam { name } => {
                 let query = payload.raw_query_string().ok_or_else(|| {
@@ -873,42 +870,8 @@ impl JwtIdentityResolver {
                     ))
                 })?;
                 let params = praxis_policy_core::http_credential::parse_query_string(query, name)
-                    .map_err(|e| {
-                        Box::new(match e {
-                            praxis_policy_core::http_credential::CredentialParseError::Duplicate {
-                                name,
-                                ..
-                            } => PluginViolation::new(
-                                "auth.ambiguous_credential",
-                                format!("duplicate query parameter name '{name}'"),
-                            ),
-                            praxis_policy_core::http_credential::CredentialParseError::PercentEncodedName {
-                                encoded,
-                                credential,
-                            } => PluginViolation::new(
-                                "auth.malformed_credential",
-                                format!(
-                                    "query parameter '{encoded}' matches credential \
-                                     '{credential}' only after percent-decoding; \
-                                     the request source must send the name literally"
-                                ),
-                            ),
-                            other => {
-                                PluginViolation::new("auth.malformed_credential", other.to_string())
-                            },
-                        })
-                    })?;
-                match params.get(name) {
-                    None => Err(Box::new(PluginViolation::new(
-                        "auth.missing_credential",
-                        format!("{} not found in request query string", self.credential),
-                    ))),
-                    Some(v) if v.is_empty() => Err(Box::new(PluginViolation::new(
-                        "auth.empty_credential",
-                        format!("{} is present but empty", self.credential),
-                    ))),
-                    Some(v) => Ok(v.clone()),
-                }
+                    .map_err(map_credential_parse_error)?;
+                pick_from_parsed(&params, name, &self.credential)
             },
             // `Credential` is `#[non_exhaustive]`; refused at construction
             // (`validate_credential`), so this is unreachable in practice.
@@ -2471,24 +2434,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_percent_encoded_query_param_name_denies_as_malformed() {
+        let resolver = resolver_on_query_param("access_token");
+        let payload = IdentityPayload::new("", TokenSource::Bearer)
+            .with_raw_query_string("access%5Ftoken=eyJ.tok");
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.malformed_credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_string_with_a_control_character_denies_as_malformed() {
+        let resolver = resolver_on_query_param("access_token");
+        let payload = IdentityPayload::new("", TokenSource::Bearer)
+            .with_raw_query_string("access_token=eyJ\x0Btok");
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.malformed_credential"
+        );
+    }
+
     /// Denial reasons must name the credential location and configured name
     /// but never the value — the "without logging the credential" requirement.
+    ///
+    /// Uses a real JWT with an untrusted issuer so the token reaches the
+    /// issuer-matching path where the raw value was genuinely in hand.
+    /// Covers both cookie and `query_param` credential locations.
     #[tokio::test]
     async fn denial_reasons_never_contain_the_credential_value() {
+        let token = jwt_with_payload(r#"{"iss":"https://untrusted.example","sub":"alice"}"#);
+
+        // Cookie path
         let resolver = resolver_on_cookie("__Host-jwt");
         let mut headers = HashMap::new();
-        headers.insert(
-            "cookie".to_owned(),
-            "__Host-jwt=super-secret-value".to_owned(),
-        );
-        // Wrong issuer, so the value was read but rejected downstream —
-        // exercising a path where the value was actually in hand.
+        headers.insert("cookie".to_owned(), format!("__Host-jwt={token}"));
         let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
         let r = resolver
             .handle(&payload, &Extensions::default(), &mut PluginContext::new())
             .await;
-        let reason = r.violation.expect("a deny carries a violation").reason;
-        assert!(!reason.contains("super-secret-value"), "{reason}");
+        let reason = r
+            .violation
+            .expect("cookie: a deny carries a violation")
+            .reason;
+        assert!(
+            !reason.contains(&token),
+            "cookie: token leaked into reason: {reason}"
+        );
+
+        // Query-param path
+        let resolver = resolver_on_query_param("access_token");
+        let payload = IdentityPayload::new("", TokenSource::Bearer)
+            .with_raw_query_string(format!("access_token={token}"));
+        let r = resolver
+            .handle(&payload, &Extensions::default(), &mut PluginContext::new())
+            .await;
+        let reason = r
+            .violation
+            .expect("query_param: a deny carries a violation")
+            .reason;
+        assert!(
+            !reason.contains(&token),
+            "query_param: token leaked into reason: {reason}"
+        );
     }
 
     /// A token with no `iss` cannot be matched to a trusted issuer, so it is

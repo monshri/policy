@@ -31,10 +31,13 @@ use thiserror::Error;
 
 /// Maximum size, in bytes, of a raw `Cookie` header value or raw query
 /// string this module will parse. RFC 6265 §6.1 recommends servers
-/// support at least 4096 bytes per cookie; most servers cap total
-/// header size at 8-16 KiB. 8 KiB keeps parsing cheap and bounds the
-/// `HashMap` a hostile request could force us to allocate.
-const MAX_INPUT_LEN: usize = 8 * 1024;
+/// support at least 4096 bytes per cookie, and a single `Cookie`
+/// header commonly carries many unrelated cookies (analytics, A/B,
+/// session), so the total can exceed 8 KiB even when the credential
+/// cookie itself is small. 16 KiB accommodates realistic headers
+/// while still bounding the `HashMap` a hostile request could force
+/// us to allocate.
+const MAX_INPUT_LEN: usize = 16 * 1024;
 
 /// Reason a raw credential string was rejected during parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -120,7 +123,7 @@ fn validate(raw: &str, location: &'static str) -> Result<(), CredentialParseErro
             max: MAX_INPUT_LEN,
         });
     }
-    if raw.contains(['\r', '\n', '\0']) {
+    if raw.bytes().any(|b| b.is_ascii_control() && b != b'\t') {
         return Err(CredentialParseError::ControlCharacter { location });
     }
     Ok(())
@@ -156,8 +159,9 @@ fn insert_unique(
 ///
 /// [`CredentialParseError::TooLong`] when `raw` exceeds the size
 /// limit, [`CredentialParseError::ControlCharacter`] when it contains
-/// `\r`, `\n`, or `\0`, and [`CredentialParseError::Duplicate`] when
-/// `credential_name` appears twice.
+/// an ASCII control character (except HTAB), and
+/// [`CredentialParseError::Duplicate`] when `credential_name` appears
+/// twice.
 pub fn parse_cookie_header(
     raw: &str,
     credential_name: &str,
@@ -197,8 +201,9 @@ pub fn parse_cookie_header(
 ///
 /// [`CredentialParseError::TooLong`] when `raw` exceeds the size
 /// limit, [`CredentialParseError::ControlCharacter`] when it contains
-/// `\r`, `\n`, or `\0`, and [`CredentialParseError::Duplicate`] when
-/// `credential_name` appears twice.
+/// an ASCII control character (except HTAB), and
+/// [`CredentialParseError::Duplicate`] when `credential_name` appears
+/// twice.
 pub fn parse_query_string(
     raw: &str,
     credential_name: &str,
@@ -334,6 +339,24 @@ mod tests {
     }
 
     #[test]
+    fn cookie_vertical_tab_rejected() {
+        let err = parse_cookie_header("a=1\x0B", "_").unwrap_err();
+        assert!(matches!(err, CredentialParseError::ControlCharacter { .. }));
+    }
+
+    #[test]
+    fn cookie_del_rejected() {
+        let err = parse_cookie_header("a=1\x7F", "_").unwrap_err();
+        assert!(matches!(err, CredentialParseError::ControlCharacter { .. }));
+    }
+
+    #[test]
+    fn cookie_tab_allowed() {
+        let m = parse_cookie_header("a=1\t", "_").unwrap();
+        assert_eq!(m.get("a").map(String::as_str), Some("1\t"));
+    }
+
+    #[test]
     fn query_single() {
         let m = parse_query_string("access_token=eyJ.abc.def", "_").unwrap();
         assert_eq!(
@@ -396,6 +419,24 @@ mod tests {
                 location: "query_param"
             }
         );
+    }
+
+    #[test]
+    fn query_vertical_tab_rejected() {
+        let err = parse_query_string("a=1\x0B", "_").unwrap_err();
+        assert!(matches!(err, CredentialParseError::ControlCharacter { .. }));
+    }
+
+    #[test]
+    fn query_del_rejected() {
+        let err = parse_query_string("a=1\x7F", "_").unwrap_err();
+        assert!(matches!(err, CredentialParseError::ControlCharacter { .. }));
+    }
+
+    #[test]
+    fn query_tab_allowed() {
+        let m = parse_query_string("a=1\t", "_").unwrap();
+        assert_eq!(m.get("a").map(String::as_str), Some("1\t"));
     }
 
     #[test]
