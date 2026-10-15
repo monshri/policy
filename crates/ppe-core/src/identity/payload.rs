@@ -196,7 +196,7 @@ struct RedactedHeaders<'a>(&'a HashMap<String, String>);
 impl std::fmt::Debug for RedactedHeaders<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map()
-            .entries(self.0.keys().map(|k| (k, "<redacted>")))
+            .entries(self.0.keys().map(|k| (k, "[REDACTED]")))
             .finish()
     }
 }
@@ -204,13 +204,13 @@ impl std::fmt::Debug for RedactedHeaders<'_> {
 impl std::fmt::Debug for IdentityPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IdentityPayload")
-            .field("raw_token", &"<redacted>")
+            .field("raw_token", &"[REDACTED]")
             .field("source", &self.source)
             .field("source_header", &self.source_header)
             .field("headers", &RedactedHeaders(&self.headers))
             .field(
                 "raw_query_string",
-                &self.raw_query_string.as_ref().map(|_| "<redacted>"),
+                &self.raw_query_string.as_ref().map(|_| "[REDACTED]"),
             )
             .field("client_host", &self.client_host)
             .field("client_port", &self.client_port)
@@ -543,7 +543,7 @@ mod tests {
             !debug.contains("super-secret-query-value"),
             "raw_query_string leaked into Debug output: {debug}"
         );
-        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]
@@ -585,7 +585,7 @@ mod tests {
             "header name missing: {debug}"
         );
         assert!(
-            debug.contains("<redacted>"),
+            debug.contains("[REDACTED]"),
             "redaction placeholder missing: {debug}"
         );
     }
@@ -632,7 +632,7 @@ mod tests {
         let with_qs = IdentityPayload::new("tok", TokenSource::Bearer)
             .with_raw_query_string("access_token=secret");
         let without_qs = IdentityPayload::new("tok", TokenSource::Bearer);
-        assert!(format!("{with_qs:?}").contains(r#"raw_query_string: Some("<redacted>")"#));
+        assert!(format!("{with_qs:?}").contains(r#"raw_query_string: Some("[REDACTED]")"#));
         assert!(format!("{without_qs:?}").contains("raw_query_string: None"));
     }
 

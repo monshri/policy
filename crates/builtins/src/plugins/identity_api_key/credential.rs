@@ -97,12 +97,24 @@ impl CredentialLocation {
     }
 
     /// The name of the wire location, whatever kind it is.
+    ///
+    /// # Panics (debug builds only)
+    ///
+    /// Panics if `credential` is an unknown future variant. `validate()`
+    /// rejects unsupported variants at config load, so this is
+    /// unreachable in practice.
     pub fn name(&self) -> &str {
         match &self.credential {
             Credential::Header { name }
             | Credential::Cookie { name }
             | Credential::QueryParam { name } => name,
-            _ => "<unknown>",
+            other => {
+                debug_assert!(
+                    false,
+                    "CredentialLocation::name() called on unsupported variant: {other}"
+                );
+                "unsupported"
+            },
         }
     }
 
@@ -116,7 +128,13 @@ impl CredentialLocation {
             Credential::Header { name } => headers
                 .get(name.to_ascii_lowercase().as_str())
                 .map(String::as_str),
-            _ => None,
+            other => {
+                debug_assert!(
+                    false,
+                    "CredentialLocation::raw() called on unsupported variant: {other}"
+                );
+                None
+            },
         }
     }
 
