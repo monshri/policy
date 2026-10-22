@@ -742,13 +742,25 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
   **Breaking for embedders**: `RawInboundToken.source_header: String` is
   replaced by `RawInboundToken.source: Credential`, and its constructor becomes
-  `RawInboundToken::new(token, source: Credential, kind)`. `Credential` (in
+  `RawInboundToken::new(token, source: Credential, kind)`. The serialized JSON
+  shape changes from `{"source_header":"Authorization"}` to
+  `{"source":{"kind":"header","name":"Authorization"}}` — the value is now a
+  `Credential` object, not a plain string, so persisted or wire JSON using the
+  old shape must be migrated. `Credential` (in
   `praxis_policy_core::extensions`) is the new shared type recording where any
   identity plugin — this one, or a future X.509/mTLS or WIMSE Proof Token
   resolver — extracted a credential from, so downstream consumers (audit
   logging, assertion propagation, policy predicates) read one uniform type
   regardless of which plugin produced it. `RawInboundToken`'s `Debug` is now
   hand-written rather than derived, and redacts the token in both cases.
+
+  `IdentityPayload.headers` is now `#[serde(skip)]` — the field is no longer
+  included in serialized output. Previously it was `skip_serializing_if =
+  "HashMap::is_empty"`, which could include request headers in serialized
+  payloads when non-empty. Headers may carry credentials and must not appear
+  in serialized output. Out-of-process hosts that relied on receiving headers
+  through serialized `IdentityPayload` should read them from the input request
+  directly.
 
 ### Fixed
 

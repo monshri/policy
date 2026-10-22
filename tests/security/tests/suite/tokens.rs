@@ -65,7 +65,7 @@ async fn each_invalid_user_token_stops_at_identity() {
                 &Persona::Bob.claims(),
                 Signer::Unsigned,
             ),
-            "auth.malformed_header",
+            "auth.malformed_credential",
         ),
         (
             "HS256 keyed with the published RSA modulus",
@@ -111,17 +111,17 @@ async fn each_invalid_user_token_stops_at_identity() {
         (
             "truncated to two segments",
             format!("{}.{}", segments[0], segments[1]),
-            "auth.malformed_header",
+            "auth.malformed_credential",
         ),
         (
             "non-base64 payload",
             format!("{}.!!not*base64!!.{}", segments[0], segments[2]),
-            "auth.malformed_header",
+            "auth.malformed_credential",
         ),
         (
             "non-base64 signature",
             format!("{}.{}.!!not*base64!!", segments[0], segments[1]),
-            "auth.malformed_header",
+            "auth.malformed_credential",
         ),
     ];
     for (label, token, code) in cases {

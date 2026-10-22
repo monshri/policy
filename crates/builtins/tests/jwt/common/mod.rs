@@ -143,13 +143,23 @@ pub(crate) async fn invoke(
 /// Drive a pre-built `IdentityPayload` through the real handler pipeline.
 ///
 /// [`invoke`] only lets a case set the bearer token and its `TokenSource` —
-/// there is no way to also populate a `Cookie` header or a raw query string.
-/// This variant takes the payload directly, so a cookie or query-param case
-/// can build one with `.with_headers(...)` / `.with_raw_query_string(...)`
-/// before driving it through the same pipeline `invoke` uses.
+/// there is no way to also populate headers or an HTTP extension. This
+/// variant takes the payload and extensions directly, so a cookie or
+/// query-param case can build the right inputs before driving them
+/// through the same pipeline `invoke` uses.
 pub(crate) async fn invoke_with_payload(
     cfg: PluginConfig,
     payload: IdentityPayload,
+) -> PipelineResult {
+    invoke_with_payload_and_ext(cfg, payload, Extensions::default()).await
+}
+
+/// Drive a pre-built `IdentityPayload` + `Extensions` through the real
+/// handler pipeline.
+pub(crate) async fn invoke_with_payload_and_ext(
+    cfg: PluginConfig,
+    payload: IdentityPayload,
+    ext: Extensions,
 ) -> PipelineResult {
     let resolver = JwtIdentityResolver::new(cfg.clone()).expect("the resolver must construct");
 
@@ -163,9 +173,21 @@ pub(crate) async fn invoke_with_payload(
     mgr.initialize().await.expect("initialize");
 
     let (result, _bg) = mgr
-        .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, Extensions::default(), None)
+        .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, ext, None)
         .await;
     result
+}
+
+/// Build an `Extensions` carrying an `HttpExtension` with the given query.
+pub(crate) fn extensions_with_query(query: Option<String>) -> Extensions {
+    use praxis_policy_core::extensions::HttpExtension;
+    Extensions {
+        http: Some(Arc::new(HttpExtension {
+            query,
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
 }
 
 /// A set's contents in a stable order, for an assertion message worth reading.

@@ -12,9 +12,9 @@ use praxis_policy_core::identity::mapping::{ClaimMapConfig, ClaimsOverrides, Con
 use serde::{Deserialize, Serialize};
 
 use crate::plugins::identity_api_key::cache::CacheConfig;
-use crate::plugins::identity_api_key::credential::CredentialLocation;
 use crate::plugins::identity_api_key::file_directory::FileDirectoryConfig;
 use crate::plugins::identity_api_key::http_directory::HttpDirectoryConfig;
+use praxis_policy_core::identity::credential::CredentialLocation;
 
 /// Which backend holds the records.
 #[derive(Debug, Clone, Serialize, Deserialize)]

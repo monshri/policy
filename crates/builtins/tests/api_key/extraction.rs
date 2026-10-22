@@ -4,7 +4,8 @@
 //! Reading the credential off the request, and the prefix gate.
 
 use crate::support::{
-    RecordFile, denial_code, file_config, hash, resolve, resolve_with_header, resolver,
+    RecordFile, cookie_config, denial_code, file_config, hash, query_param_config, resolve,
+    resolve_with_cookie, resolve_with_header, resolve_with_query, resolver,
 };
 
 use std::collections::HashMap;
@@ -232,7 +233,10 @@ fn an_empty_header_name_is_refused_at_config_load() {
 
     let error = resolver(config).expect_err("an empty name must not build");
 
-    assert!(error.contains("empty name"), "got: {error}");
+    assert!(
+        error.contains("empty name") || error.contains("non-empty"),
+        "got: {error}"
+    );
 }
 
 /// A leading space would be read as an empty auth scheme, and then no value
@@ -257,4 +261,148 @@ fn a_prefix_inside_credential_is_refused_at_config_load() {
 
     let error = resolver(config).expect_err("a misplaced prefix must not build");
     assert!(error.contains("unknown field"), "got: {error}");
+}
+
+// ---- cookie credential extraction -----------------------------------------
+
+#[tokio::test]
+async fn a_cookie_credential_resolves_an_identity() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result =
+        resolve_with_cookie(&resolver, "session=x; api_key=sk-oai-secret; theme=dark").await;
+
+    assert!(
+        denial_code(&result).is_none(),
+        "a valid cookie key must resolve: {:?}",
+        denial_code(&result)
+    );
+}
+
+#[tokio::test]
+async fn a_missing_cookie_denies_as_missing() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve_with_cookie(&resolver, "session=x; theme=dark").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.missing_credential")
+    );
+}
+
+#[tokio::test]
+async fn a_missing_cookie_header_denies_as_missing() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve(&resolver, HashMap::new()).await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.missing_credential")
+    );
+}
+
+#[tokio::test]
+async fn an_empty_cookie_credential_denies_as_empty() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve_with_cookie(&resolver, "api_key=").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.empty_credential")
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_cookie_name_denies_as_ambiguous() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve_with_cookie(&resolver, "api_key=a; api_key=b").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.ambiguous_credential"),
+        "a duplicate credential cookie name must not resolve"
+    );
+}
+
+// ---- query-param credential extraction ------------------------------------
+
+#[tokio::test]
+async fn a_query_param_credential_resolves_an_identity() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "page=1&api_key=sk-oai-secret&limit=10").await;
+
+    assert!(
+        denial_code(&result).is_none(),
+        "a valid query-param key must resolve: {:?}",
+        denial_code(&result)
+    );
+}
+
+#[tokio::test]
+async fn a_missing_query_param_denies_as_missing() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "page=1&limit=10").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.missing_credential")
+    );
+}
+
+#[tokio::test]
+async fn no_query_string_denies_as_missing() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve(&resolver, HashMap::new()).await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.missing_credential")
+    );
+}
+
+#[tokio::test]
+async fn an_empty_query_param_credential_denies_as_empty() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "api_key=").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.empty_credential")
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_query_param_name_denies_as_ambiguous() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "api_key=a&api_key=b").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.ambiguous_credential"),
+        "a duplicate credential query param must not resolve"
+    );
 }

@@ -31,8 +31,8 @@
 use crate::common;
 
 use common::{
-    TEST_AUDIENCE, TEST_ISSUER, invoke, invoke_with_payload, mint_exact as mint_jwt, now_unix,
-    plugin_config,
+    TEST_AUDIENCE, TEST_ISSUER, extensions_with_query, invoke, invoke_with_payload,
+    invoke_with_payload_and_ext, mint_exact as mint_jwt, now_unix, plugin_config,
 };
 use std::collections::HashMap;
 
@@ -73,11 +73,16 @@ fn resolver_plugin_config_for_cookie(name: &str) -> PluginConfig {
 }
 
 /// A resolver reading its token from the given query parameter name.
+///
+/// Includes `read_query` so the capability filter passes
+/// `HttpExtension.query` through to the handler.
 fn resolver_plugin_config_for_query_param(name: &str) -> PluginConfig {
-    plugin_config(json!({
+    let mut cfg = plugin_config(json!({
         "claim_mapper": "standard",
         "credential": { "kind": "query_param", "name": name },
-    }))
+    }));
+    cfg.capabilities.insert("read_query".to_owned());
+    cfg
 }
 
 // =====================================================================
@@ -177,12 +182,13 @@ async fn valid_jwt_from_query_param_resolves_subject() {
         "iat": now_unix(),
     }));
 
-    let payload = IdentityPayload::new("", TokenSource::Bearer)
-        .with_raw_query_string(format!("access_token={token}"));
+    let payload = IdentityPayload::new("", TokenSource::Bearer);
+    let ext = extensions_with_query(Some(format!("access_token={token}")));
 
-    let result = invoke_with_payload(
+    let result = invoke_with_payload_and_ext(
         resolver_plugin_config_for_query_param("access_token"),
         payload,
+        ext,
     )
     .await;
     assert!(
@@ -248,12 +254,13 @@ async fn raw_inbound_token_records_query_param_origin() {
         "iat": now_unix(),
     }));
 
-    let payload = IdentityPayload::new("", TokenSource::Bearer)
-        .with_raw_query_string(format!("access_token={token}"));
+    let payload = IdentityPayload::new("", TokenSource::Bearer);
+    let ext = extensions_with_query(Some(format!("access_token={token}")));
 
-    let result = invoke_with_payload(
+    let result = invoke_with_payload_and_ext(
         resolver_plugin_config_for_query_param("access_token"),
         payload,
+        ext,
     )
     .await;
     assert!(result.continue_processing, "{:?}", result.violation);
@@ -515,7 +522,7 @@ async fn tampered_signature_rejects() {
     // encoding of a 256-byte RSA-2048 signature requires its last
     // char to encode 4 trailing-bit zeros — only `{A, Q, g, w}`
     // satisfy that. A naive flip to an out-of-set char produces
-    // invalid base64 (decoder error → `auth.malformed_header`)
+    // invalid base64 (decoder error → `auth.malformed_credential`)
     // rather than valid bytes that fail signature verification.
     // Middle-segment chars don't have the trailing-bit constraint.
     let parts: Vec<&str> = valid.split('.').collect();
@@ -536,7 +543,7 @@ async fn tampered_signature_rejects() {
     assert_eq!(v.code, "auth.signature_invalid");
 }
 
-/// Token with no `iss` claim at all → `auth.malformed_header` from
+/// Token with no `iss` claim at all → `auth.malformed_credential` from
 /// the peek step (we can't pick a trusted issuer without `iss`).
 #[tokio::test]
 async fn missing_iss_rejects() {
@@ -550,7 +557,7 @@ async fn missing_iss_rejects() {
     let result = invoke_bearer(token).await;
     assert!(!result.continue_processing);
     let v = result.violation.expect("rejection should surface");
-    assert_eq!(v.code, "auth.malformed_header");
+    assert_eq!(v.code, "auth.malformed_credential");
 }
 
 // =====================================================================
@@ -733,12 +740,13 @@ async fn empty_cookie_value_rejects_with_empty_credential() {
 /// present-but-empty → `auth.empty_credential`.
 #[tokio::test]
 async fn empty_query_param_value_rejects_with_empty_credential() {
-    let payload = IdentityPayload::new("", TokenSource::Bearer)
-        .with_raw_query_string("access_token=".to_owned());
+    let payload = IdentityPayload::new("", TokenSource::Bearer);
+    let ext = extensions_with_query(Some("access_token=".to_owned()));
 
-    let result = invoke_with_payload(
+    let result = invoke_with_payload_and_ext(
         resolver_plugin_config_for_query_param("access_token"),
         payload,
+        ext,
     )
     .await;
     assert!(!result.continue_processing);
@@ -773,12 +781,13 @@ async fn duplicate_cookie_name_rejects_with_ambiguous_credential() {
 /// `auth.ambiguous_credential`.
 #[tokio::test]
 async fn duplicate_query_param_name_rejects_with_ambiguous_credential() {
-    let payload = IdentityPayload::new("", TokenSource::Bearer)
-        .with_raw_query_string("access_token=a&access_token=b".to_owned());
+    let payload = IdentityPayload::new("", TokenSource::Bearer);
+    let ext = extensions_with_query(Some("access_token=a&access_token=b".to_owned()));
 
-    let result = invoke_with_payload(
+    let result = invoke_with_payload_and_ext(
         resolver_plugin_config_for_query_param("access_token"),
         payload,
+        ext,
     )
     .await;
     assert!(!result.continue_processing);
@@ -808,12 +817,13 @@ async fn cookie_with_control_char_rejects_with_malformed_credential() {
 /// `auth.malformed_credential`.
 #[tokio::test]
 async fn query_string_with_control_char_rejects_with_malformed_credential() {
-    let payload = IdentityPayload::new("", TokenSource::Bearer)
-        .with_raw_query_string("access_token=tok\nen".to_owned());
+    let payload = IdentityPayload::new("", TokenSource::Bearer);
+    let ext = extensions_with_query(Some("access_token=tok\nen".to_owned()));
 
-    let result = invoke_with_payload(
+    let result = invoke_with_payload_and_ext(
         resolver_plugin_config_for_query_param("access_token"),
         payload,
+        ext,
     )
     .await;
     assert!(!result.continue_processing);
@@ -841,12 +851,13 @@ async fn cookie_name_not_found_rejects_with_missing_credential() {
 /// `auth.missing_credential`.
 #[tokio::test]
 async fn query_param_name_not_found_rejects_with_missing_credential() {
-    let payload = IdentityPayload::new("", TokenSource::Bearer)
-        .with_raw_query_string("other=value".to_owned());
+    let payload = IdentityPayload::new("", TokenSource::Bearer);
+    let ext = extensions_with_query(Some("other=value".to_owned()));
 
-    let result = invoke_with_payload(
+    let result = invoke_with_payload_and_ext(
         resolver_plugin_config_for_query_param("access_token"),
         payload,
+        ext,
     )
     .await;
     assert!(!result.continue_processing);
@@ -904,12 +915,13 @@ async fn query_param_selected_from_multi_param_query_string() {
         "iat": now_unix(),
     }));
 
-    let payload = IdentityPayload::new("", TokenSource::Bearer)
-        .with_raw_query_string(format!("page=2&access_token={token}&limit=50"));
+    let payload = IdentityPayload::new("", TokenSource::Bearer);
+    let ext = extensions_with_query(Some(format!("page=2&access_token={token}&limit=50")));
 
-    let result = invoke_with_payload(
+    let result = invoke_with_payload_and_ext(
         resolver_plugin_config_for_query_param("access_token"),
         payload,
+        ext,
     )
     .await;
     assert!(

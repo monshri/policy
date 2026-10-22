@@ -687,7 +687,11 @@ async fn a_call_without_tokens_is_denied_at_the_identity_gate() {
         let out = host.call(Call::anonymous("get_compensation")).await;
         let pdp = fixture.name();
         assert_eq!(out.denied_at, Some(Stage::Identity), "{pdp}");
-        assert_eq!(out.violation_code(), Some("auth.malformed_header"), "{pdp}");
+        assert_eq!(
+            out.violation_code(),
+            Some("auth.missing_credential"),
+            "{pdp}"
+        );
         assert!(
             out.events.audit_records().is_empty(),
             "{pdp}: no CMF hook ran, so the audit plugin did not"
@@ -1091,6 +1095,7 @@ plugins:
   - name: jwt-query
     kind: identity/jwt
     hooks: [identity.resolve]
+    capabilities: [read_query]
     config:
       role: user
       credential:
@@ -1147,19 +1152,272 @@ async fn cookie_credential_resolves_identity() {
 /// A JWT carried in a query parameter resolves the user identity end-to-end.
 #[tokio::test]
 async fn query_param_credential_resolves_identity() {
+    use praxis_policy_core::extensions::HttpExtension;
+
     let engine = host::engine(Vec::new());
     engine.load_config_yaml(QUERY_PARAM_CONFIG).expect("load");
     engine.initialize().await.expect("initialize");
 
     let token = hs256_token(&standard_claims());
-    let payload = IdentityPayload::new(String::new(), TokenSource::Bearer)
-        .with_raw_query_string(format!("access_token={token}"));
+    let payload = IdentityPayload::new(String::new(), TokenSource::Bearer);
+    let ext = Extensions {
+        http: Some(std::sync::Arc::new(HttpExtension {
+            query: Some(format!("access_token={token}")),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
     let (result, _bg) = engine
-        .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, Extensions::default(), None)
+        .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, ext, None)
         .await;
     assert!(result.continue_processing, "denied: {:?}", result.violation);
 
     let identity = IdentityPayload::from_pipeline_result(&result).expect("resolved identity");
     let subject = identity.subject.expect("a user subject");
     assert_eq!(subject.id.as_deref(), Some("cookie-user"));
+}
+
+// =====================================================================
+// Query-param JWT + http.query policy from the same request
+// =====================================================================
+
+mod query_identity_and_policy {
+    use super::*;
+    use praxis_policy_core::extensions::HttpExtension;
+
+    fn query_ext(query: Option<String>) -> Extensions {
+        Extensions {
+            http: Some(std::sync::Arc::new(HttpExtension {
+                query,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_resolves_from_query_param() {
+        let engine = host::engine(Vec::new());
+        engine.load_config_yaml(QUERY_PARAM_CONFIG).expect("load");
+        engine.initialize().await.expect("initialize");
+
+        let token = hs256_token(&standard_claims());
+        let qs = format!("access_token={token}&format=json");
+        let payload = IdentityPayload::new(String::new(), TokenSource::Bearer);
+        let ext = query_ext(Some(qs.clone()));
+        let (result, _bg) = engine
+            .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, ext, None)
+            .await;
+        assert!(result.continue_processing, "denied: {:?}", result.violation);
+
+        let identity = IdentityPayload::from_pipeline_result(&result).expect("resolved identity");
+        let subject = identity.subject.as_ref().expect("a user subject");
+        assert_eq!(subject.id.as_deref(), Some("cookie-user"));
+
+        let policy_ext = identity.apply_to_extensions(query_ext(Some(qs)));
+        let http = policy_ext
+            .http
+            .as_ref()
+            .expect("HttpExtension survives apply_to_extensions");
+        assert!(
+            http.query
+                .as_ref()
+                .is_some_and(|q| q.contains("format=json")),
+            "policy must see the full query for http.query predicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_query_rejects_as_missing() {
+        let engine = host::engine(Vec::new());
+        engine.load_config_yaml(QUERY_PARAM_CONFIG).expect("load");
+        engine.initialize().await.expect("initialize");
+
+        let payload = IdentityPayload::new(String::new(), TokenSource::Bearer);
+        let (result, _bg) = engine
+            .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, query_ext(None), None)
+            .await;
+        assert!(!result.continue_processing);
+        let v = result.violation.expect("violation surfaced");
+        assert_eq!(v.code, "auth.missing_credential");
+    }
+
+    #[tokio::test]
+    async fn bare_question_mark_rejects_as_missing() {
+        let engine = host::engine(Vec::new());
+        engine.load_config_yaml(QUERY_PARAM_CONFIG).expect("load");
+        engine.initialize().await.expect("initialize");
+
+        let payload = IdentityPayload::new(String::new(), TokenSource::Bearer);
+        let (result, _bg) = engine
+            .invoke_named::<IdentityHook>(
+                HOOK_IDENTITY_RESOLVE,
+                payload,
+                query_ext(Some(String::new())),
+                None,
+            )
+            .await;
+        assert!(!result.continue_processing);
+        let v = result.violation.expect("violation surfaced");
+        assert_eq!(v.code, "auth.missing_credential");
+    }
+
+    #[tokio::test]
+    async fn extra_params_identity_resolves_policy_sees_full_query() {
+        let engine = host::engine(Vec::new());
+        engine.load_config_yaml(QUERY_PARAM_CONFIG).expect("load");
+        engine.initialize().await.expect("initialize");
+
+        let token = hs256_token(&standard_claims());
+        let qs = format!("page=2&access_token={token}&limit=50");
+        let payload = IdentityPayload::new(String::new(), TokenSource::Bearer);
+        let ext = query_ext(Some(qs.clone()));
+        let (result, _bg) = engine
+            .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, ext, None)
+            .await;
+        assert!(result.continue_processing, "denied: {:?}", result.violation);
+
+        let identity = IdentityPayload::from_pipeline_result(&result).expect("resolved identity");
+        assert!(identity.subject.is_some());
+
+        let policy_ext = identity.apply_to_extensions(query_ext(Some(qs)));
+        let http = policy_ext.http.as_ref().expect("http present");
+        assert!(http.query.as_ref().is_some_and(|q| q.contains("page=2")));
+        assert!(http.query.as_ref().is_some_and(|q| q.contains("limit=50")));
+    }
+
+    #[tokio::test]
+    async fn denied_request_diagnostics_do_not_leak_token() {
+        let engine = host::engine(Vec::new());
+        engine.load_config_yaml(QUERY_PARAM_CONFIG).expect("load");
+        engine.initialize().await.expect("initialize");
+
+        let token = idp::forge(
+            &json!({"alg": "HS256", "typ": "JWT"}),
+            &json!({
+                "iss": "https://evil.example",
+                "aud": "praxis-gateway",
+                "sub": "attacker",
+                "exp": 4_102_444_800_u64,
+            }),
+            idp::Signer::Hs256(HS256_SECRET.as_bytes()),
+        );
+        let qs = format!("access_token={token}");
+        let payload = IdentityPayload::new(String::new(), TokenSource::Bearer);
+        let (result, _bg) = engine
+            .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, query_ext(Some(qs)), None)
+            .await;
+        assert!(!result.continue_processing);
+        let v = result.violation.expect("violation surfaced");
+        assert!(
+            !v.reason.contains(&token),
+            "the raw token must not appear in denial diagnostics: {}",
+            v.reason,
+        );
+    }
+
+    #[tokio::test]
+    async fn http_extension_debug_and_serialize_redact_query() {
+        let token = hs256_token(&standard_claims());
+        let qs = format!("access_token={token}");
+        let http = HttpExtension {
+            query: Some(qs),
+            ..Default::default()
+        };
+        let debug = format!("{http:?}");
+        let json = serde_json::to_string(&http).expect("serialize HttpExtension");
+        for output in [&debug, &json] {
+            assert!(
+                !output.contains(&token),
+                "token leaked into output: {output}"
+            );
+            assert!(output.contains("[REDACTED]"), "missing redaction: {output}");
+        }
+    }
+}
+
+// =====================================================================
+// Capability isolation: read_query vs read_headers
+// =====================================================================
+
+mod query_capability_isolation {
+    use praxis_policy_core::extensions::HttpExtension;
+    use praxis_policy_core::extensions::filter::filter_extensions;
+    use praxis_policy_core::hooks::payload::Extensions;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn http_ext_with_query() -> Extensions {
+        let mut http = HttpExtension::default();
+        http.set_request_header("x-request-id", "123");
+        http.method = Some("GET".to_owned());
+        http.path = Some("/api/data".to_owned());
+        http.query = Some("access_token=secret&format=json".to_owned());
+        Extensions {
+            http: Some(Arc::new(http)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn read_query_without_read_headers_sees_query_only() {
+        let ext = http_ext_with_query();
+        let caps: HashSet<String> = ["read_query".to_owned()].into();
+        let filtered = filter_extensions(&ext, &caps);
+        let http = filtered.http.as_ref().expect("read_query grants HTTP");
+        assert_eq!(
+            http.query.as_deref(),
+            Some("access_token=secret&format=json"),
+        );
+        assert!(http.request_headers.is_empty());
+        assert!(http.method.is_none());
+        assert!(http.path.is_none());
+    }
+
+    #[test]
+    fn read_headers_without_read_query_hides_query() {
+        let ext = http_ext_with_query();
+        let caps: HashSet<String> = ["read_headers".to_owned()].into();
+        let filtered = filter_extensions(&ext, &caps);
+        let http = filtered.http.as_ref().expect("read_headers grants HTTP");
+        assert_eq!(http.query, None, "query must be hidden without read_query");
+        assert_eq!(http.get_request_header("x-request-id"), Some("123"));
+        assert_eq!(http.method.as_deref(), Some("GET"));
+    }
+
+    #[test]
+    fn both_capabilities_expose_everything() {
+        let ext = http_ext_with_query();
+        let caps: HashSet<String> = ["read_headers".to_owned(), "read_query".to_owned()].into();
+        let filtered = filter_extensions(&ext, &caps);
+        let http = filtered.http.as_ref().expect("both grant HTTP");
+        assert_eq!(
+            http.query.as_deref(),
+            Some("access_token=secret&format=json"),
+        );
+        assert_eq!(http.get_request_header("x-request-id"), Some("123"));
+        assert_eq!(http.method.as_deref(), Some("GET"));
+    }
+
+    #[test]
+    fn serialized_roundtrip_redacts_query_even_with_read_query() {
+        let ext = http_ext_with_query();
+        let caps: HashSet<String> = ["read_query".to_owned()].into();
+        let filtered = filter_extensions(&ext, &caps);
+        let http = filtered.http.as_ref().expect("read_query grants HTTP");
+
+        assert_eq!(
+            http.query.as_deref(),
+            Some("access_token=secret&format=json"),
+        );
+
+        let json = serde_json::to_string(http.as_ref()).expect("serialize HttpExtension");
+        assert!(!json.contains("secret"), "token leaked in JSON: {json}");
+        let back: HttpExtension = serde_json::from_str(&json).expect("deserialize HttpExtension");
+        assert_eq!(
+            back.query.as_deref(),
+            Some("[REDACTED]"),
+            "round-trip must recover the placeholder, not the value"
+        );
+    }
 }

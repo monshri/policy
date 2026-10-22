@@ -33,9 +33,12 @@
 // Runtime token rejections → `PluginResult::deny(PluginViolation::new(code, reason))`.
 // Stable codes for runtime denials:
 //
-//   * `auth.malformed_header` — JWT structure wrong / empty token (header credential)
-//   * `auth.malformed_credential` — cookie or query-param credential: parse
-//     failure or malformed JWT structure
+//   * `auth.missing_credential` — credential not found at the configured location
+//   * `auth.empty_credential` — credential present but empty
+//   * `auth.ambiguous_credential` — duplicate header casings, duplicate Cookie
+//     headers, or duplicate cookie/query-param names
+//   * `auth.malformed_credential` — JWT structure wrong, parse failure, or
+//     malformed credential input
 //   * `auth.untrusted_issuer` — `iss` not in trusted list
 //   * `auth.signature_invalid` — signature failed
 //   * `auth.token_expired` — `exp` in the past
@@ -61,6 +64,7 @@ use praxis_policy_core::extensions::raw_credentials::{
 };
 use praxis_policy_core::hooks::payload::Extensions;
 use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
+use praxis_policy_core::identity::credential::{CredentialLocation, Extraction};
 use praxis_policy_core::identity::{IdentityHook, IdentityPayload};
 use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
@@ -134,7 +138,7 @@ pub struct JwtIdentityResolver {
     /// different locations; the value lands on
     /// `RawInboundToken.source` so forwarding plugins know where to
     /// put it (or strip it) on the upstream call.
-    credential: Credential,
+    location: CredentialLocation,
 }
 
 // Implement `Debug` manually because `cfg` and `pending_jwks` may contain HMAC
@@ -144,7 +148,7 @@ impl std::fmt::Debug for JwtIdentityResolver {
         f.debug_struct("JwtIdentityResolver")
             .field("name", &self.cfg.name)
             .field("role", &self.role)
-            .field("credential", &self.credential)
+            .field("location", &self.location)
             .field("pending_jwks_count", &self.pending_jwks.len())
             .field("cfg", &"<redacted>")
             .field("pending_jwks", &"<redacted>")
@@ -322,7 +326,14 @@ impl JwtIdentityResolver {
         let credential = typed.credential.unwrap_or_else(|| Credential::Header {
             name: "Authorization".to_owned(),
         });
-        validate_credential(&credential).map_err(|e| {
+
+        // Build a CredentialLocation with no prefix — the JWT resolver
+        // handles Bearer stripping as a post-extraction normalization
+        // step rather than through the prefix gate, because
+        // strip_bearer_prefix is permissive (bare tokens pass through)
+        // while the prefix gate is strict (WrongPrefix on mismatch).
+        let location = CredentialLocation::new(credential.clone(), None);
+        location.validate().map_err(|e| {
             Box::new(PluginError::Config {
                 message: format!(
                     "plugin '{}' (praxis-policy-plugin-identity-jwt): {e}",
@@ -352,46 +363,9 @@ impl JwtIdentityResolver {
             pending_jwks,
             claim_mapper,
             role: typed.role,
-            credential,
+            location,
         })
     }
-}
-
-/// Validate a resolved `credential:` value at construction time, so a
-/// misconfigured location fails at load rather than denying every request.
-///
-/// - `Header { name }` / `QueryParam { name }`: name must be non-blank.
-/// - `Cookie { name }`: name must be non-blank and must not contain `=` or
-///   `;` — either would make the configured name unparseable as a single
-///   cookie name by `http_credential::parse_cookie_header`.
-fn validate_credential(credential: &Credential) -> Result<(), String> {
-    let (kind, name) = match credential {
-        Credential::Header { name } => ("header", name.as_str()),
-        Credential::QueryParam { name } => ("query_param", name.as_str()),
-        Credential::Cookie { name } => ("cookie", name.as_str()),
-        _ => {
-            return Err(format!(
-                "`credential: {{ kind: {credential} }}` is not supported"
-            ));
-        },
-    };
-    if name.trim().is_empty() {
-        return Err(format!(
-            "`credential: {{ kind: {kind} }}` name must be non-empty"
-        ));
-    }
-    if name != name.trim() || name.contains(char::is_whitespace) {
-        return Err(format!(
-            "`credential: {{ kind: {kind}, name: '{name}' }}` \
-             must not contain leading, trailing, or interior whitespace"
-        ));
-    }
-    if matches!(credential, Credential::Cookie { .. }) && name.contains(['=', ';']) {
-        return Err(format!(
-            "`credential: {{ kind: cookie, name: '{name}' }}` must not contain '=' or ';'"
-        ));
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -730,156 +704,70 @@ impl JwtIdentityResolver {
     }
 }
 
-fn map_credential_parse_error(
-    e: praxis_policy_core::http_credential::CredentialParseError,
-) -> Box<PluginViolation> {
-    use praxis_policy_core::http_credential::CredentialParseError;
-    Box::new(match e {
-        CredentialParseError::Duplicate { name, .. } => PluginViolation::new(
-            "auth.ambiguous_credential",
-            format!("duplicate credential name '{name}'"),
-        ),
-        CredentialParseError::PercentEncodedName {
-            encoded,
-            credential,
-        } => PluginViolation::new(
-            "auth.malformed_credential",
-            format!(
-                "query parameter '{encoded}' matches credential \
-                 '{credential}' only after percent-decoding; \
-                 the request source must send the name literally"
-            ),
-        ),
-        other => PluginViolation::new("auth.malformed_credential", other.to_string()),
-    })
-}
-
-fn pick_from_parsed(
-    map: &std::collections::HashMap<String, String>,
-    name: &str,
-    credential: &Credential,
-) -> Result<String, Box<PluginViolation>> {
-    match map.get(name) {
-        None => Err(Box::new(PluginViolation::new(
-            "auth.missing_credential",
-            format!("{credential} not found in request"),
-        ))),
-        Some(v) if v.is_empty() => Err(Box::new(PluginViolation::new(
-            "auth.empty_credential",
-            format!("{credential} is present but empty"),
-        ))),
-        Some(v) => Ok(v.clone()),
-    }
-}
-
 impl JwtIdentityResolver {
-    /// Extract the raw bearer token from wherever `self.credential` says it
-    /// lives — an HTTP header, a `Cookie` header entry, or a query
-    /// parameter. All three sources live on `IdentityPayload`, so this
-    /// takes only `payload` — no dependency on `Extensions` or
-    /// `HttpExtension`.
+    /// Extract the raw token from wherever `self.location` says it lives.
     ///
-    /// Every denial reason names the credential location and configured
-    /// name (e.g. `cookie '__Host-jwt'`, `query_param 'access_token'`) but
-    /// never the value — satisfies the "without logging the credential"
-    /// requirement.
-    fn extract_token(&self, payload: &IdentityPayload) -> Result<String, Box<PluginViolation>> {
-        match &self.credential {
-            Credential::Header { name } => {
-                // HTTP headers are case-insensitive (RFC 7230 §3.2).
-                // Scan the map case-insensitively to handle hosts that
-                // may use any capitalisation. Reject ambiguous duplicate
-                // keys (multiple casings of the same name). Fall back to
-                // `payload.raw_token()` only when no header map is
-                // populated — covers single-resolver back-compat for
-                // hosts that still pre-extract one token.
-                let name_lc = name.to_ascii_lowercase();
-                let matches: Vec<&str> = payload
-                    .headers()
-                    .iter()
-                    .filter(|(k, _)| k.eq_ignore_ascii_case(&name_lc))
-                    .map(|(_, v)| v.as_str())
-                    .collect();
-                let raw_token = match matches.as_slice() {
-                    [single] => strip_bearer_prefix(single).to_owned(),
-                    [] if payload.headers().is_empty() && !payload.raw_token().is_empty() => {
-                        payload.raw_token().to_owned()
-                    },
-                    [] => {
-                        return Err(Box::new(PluginViolation::new(
-                            "auth.malformed_header",
-                            format!(
-                                "{} missing from request (resolver '{}' / role '{:?}')",
-                                self.credential, self.cfg.name, self.role
-                            ),
-                        )));
-                    },
-                    _ => {
-                        return Err(Box::new(PluginViolation::new(
-                            "auth.ambiguous_credential",
-                            format!("multiple headers matching '{name}' with different casing"),
-                        )));
-                    },
-                };
-                if raw_token.is_empty() {
-                    return Err(Box::new(PluginViolation::new(
-                        "auth.malformed_header",
-                        format!("{} is present but empty", self.credential),
-                    )));
-                }
-                Ok(raw_token)
-            },
-            Credential::Cookie { name } => {
-                let cookie_values: Vec<&str> = payload
-                    .headers()
-                    .iter()
-                    .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
-                    .map(|(_, v)| v.as_str())
-                    .collect();
-                let cookie_header = match cookie_values.as_slice() {
-                    [] => {
-                        return Err(Box::new(PluginViolation::new(
-                            "auth.missing_credential",
-                            format!(
-                                "no Cookie header in request (resolver '{}' expects {})",
-                                self.cfg.name, self.credential
-                            ),
-                        )));
-                    },
-                    [single] => single,
-                    _ => {
-                        return Err(Box::new(PluginViolation::new(
-                            "auth.ambiguous_credential",
-                            "multiple Cookie headers with different casing",
-                        )));
-                    },
-                };
-                let cookies =
-                    praxis_policy_core::http_credential::parse_cookie_header(cookie_header, name)
-                        .map_err(map_credential_parse_error)?;
-                pick_from_parsed(&cookies, name, &self.credential)
-            },
-            Credential::QueryParam { name } => {
-                let query = payload.raw_query_string().ok_or_else(|| {
-                    Box::new(PluginViolation::new(
+    /// For headers, keeps JWT-specific Bearer stripping as
+    /// post-extraction normalization (bare tokens pass through) and the
+    /// `raw_token()` back-compat fallback. Ambiguity detection is now
+    /// handled by `CredentialLocation::raw()`.
+    ///
+    /// For cookies and query parameters, delegates entirely to
+    /// `CredentialLocation::raw()`.
+    fn extract_token(
+        &self,
+        payload: &IdentityPayload,
+        ext: &Extensions,
+    ) -> Result<String, Box<PluginViolation>> {
+        if matches!(self.location.credential, Credential::Header { .. })
+            && payload.headers().is_empty()
+            && !payload.raw_token().is_empty()
+        {
+            return Ok(payload.raw_token().to_owned());
+        }
+
+        let raw = self
+            .location
+            .raw_from_ext(payload.headers(), ext)
+            .map_err(|extraction| {
+                Box::new(match extraction {
+                    Extraction::Missing => PluginViolation::new(
+                        "auth.missing_credential",
+                        format!("{} not found in request", self.location.credential),
+                    ),
+                    Extraction::Empty => PluginViolation::new(
+                        "auth.empty_credential",
+                        format!("{} is present but empty", self.location.credential),
+                    ),
+                    Extraction::Ambiguous => PluginViolation::new(
+                        "auth.ambiguous_credential",
+                        format!("ambiguous credential at {}", self.location.credential),
+                    ),
+                    Extraction::Malformed => PluginViolation::new(
+                        "auth.malformed_credential",
+                        format!("malformed credential at {}", self.location.credential),
+                    ),
+                    Extraction::WrongPrefix => PluginViolation::new(
                         "auth.missing_credential",
                         format!(
-                            "no query string supplied by host (resolver '{}' expects {})",
-                            self.cfg.name, self.credential
+                            "{} does not match the configured prefix",
+                            self.location.credential
                         ),
-                    ))
-                })?;
-                let params = praxis_policy_core::http_credential::parse_query_string(query, name)
-                    .map_err(map_credential_parse_error)?;
-                pick_from_parsed(&params, name, &self.credential)
-            },
-            // `Credential` is `#[non_exhaustive]`; refused at construction
-            // (`validate_credential`), so this is unreachable in practice.
-            // Defense in depth rather than a silent extraction failure.
-            _ => Err(Box::new(PluginViolation::new(
-                "auth.misconfigured",
-                format!("credential kind '{}' is not supported", self.credential),
-            ))),
+                    ),
+                    _ => PluginViolation::new(
+                        "auth.malformed_credential",
+                        format!(
+                            "unexpected extraction outcome for {}",
+                            self.location.credential
+                        ),
+                    ),
+                })
+            })?;
+
+        if matches!(self.location.credential, Credential::Header { .. }) {
+            Ok(strip_bearer_prefix(&raw).to_owned())
+        } else {
+            Ok(raw)
         }
     }
 }
@@ -891,7 +779,7 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
         ext: &Extensions,
         _ctx: &mut PluginContext,
     ) -> PluginResult<IdentityPayload> {
-        let raw_token = match self.extract_token(payload) {
+        let raw_token = match self.extract_token(payload, ext) {
             Ok(t) => t,
             Err(violation) => return PluginResult::deny(*violation),
         };
@@ -901,7 +789,7 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
             Some(iss) => iss,
             None => {
                 return PluginResult::deny(PluginViolation::new(
-                    malformed_code(&self.credential),
+                    "auth.malformed_credential",
                     "JWT not well-formed or missing `iss` claim",
                 ));
             },
@@ -1027,7 +915,7 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
                 ));
             },
             Err(ValidateError::Jwt(e)) => {
-                let (code, reason) = classify_jwt_error(&e, &self.credential);
+                let (code, reason) = classify_jwt_error(&e);
                 return PluginResult::deny(PluginViolation::new(code, reason));
             },
         };
@@ -1111,7 +999,7 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
         let mut raw_creds = updated.raw_credentials.clone().unwrap_or_default();
         raw_creds.inbound_tokens.insert(
             self.role.clone(),
-            RawInboundToken::new(raw_token, self.credential.clone(), kind),
+            RawInboundToken::new(raw_token, self.location.credential.clone(), kind),
         );
         updated.raw_credentials = Some(raw_creds);
         updated.resolved_at = Some(chrono::Utc::now());
@@ -1289,18 +1177,8 @@ fn has_unsupported_critical_extensions(header: &jsonwebtoken::Header) -> bool {
     header.crit.as_ref().is_some_and(|crit| !crit.is_empty())
 }
 
-fn malformed_code(credential: &Credential) -> &'static str {
-    match credential {
-        Credential::Header { .. } => "auth.malformed_header",
-        _ => "auth.malformed_credential",
-    }
-}
-
 /// Map jsonwebtoken errors to stable violation codes.
-fn classify_jwt_error(
-    e: &jsonwebtoken::errors::Error,
-    credential: &Credential,
-) -> (&'static str, String) {
+fn classify_jwt_error(e: &jsonwebtoken::errors::Error) -> (&'static str, String) {
     use jsonwebtoken::errors::ErrorKind;
     let code = match e.kind() {
         ErrorKind::ExpiredSignature => "auth.token_expired",
@@ -1310,7 +1188,7 @@ fn classify_jwt_error(
         ErrorKind::MissingRequiredClaim(c) if c == "aud" => "auth.audience_mismatch",
         ErrorKind::InvalidIssuer => "auth.untrusted_issuer",
         ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => "auth.algorithm_mismatch",
-        ErrorKind::Base64(_) | ErrorKind::Json(_) => malformed_code(credential),
+        ErrorKind::Base64(_) | ErrorKind::Json(_) => "auth.malformed_credential",
         _ => "auth.token_invalid",
     };
     (code, e.to_string())
@@ -1850,9 +1728,6 @@ mod tests {
     #[test]
     fn classify_picks_expected_codes() {
         use jsonwebtoken::errors::{Error, ErrorKind};
-        let header_cred = Credential::Header {
-            name: "authorization".into(),
-        };
         let cases = [
             (ErrorKind::ExpiredSignature, "auth.token_expired"),
             (ErrorKind::InvalidSignature, "auth.signature_invalid"),
@@ -1862,16 +1737,14 @@ mod tests {
         ];
         for (kind, expected_code) in cases {
             let err = Error::from(kind);
-            let (code, _reason) = classify_jwt_error(&err, &header_cred);
+            let (code, _reason) = classify_jwt_error(&err);
             assert_eq!(code, expected_code);
         }
     }
 
     #[test]
-    fn classify_jwt_error_uses_credential_aware_code_for_base64() {
+    fn classify_jwt_error_uses_malformed_credential_for_base64() {
         use jsonwebtoken::errors::ErrorKind;
-        // Construct a JWT with an invalid base64 header segment, decode it
-        // to get a real Base64 error from jsonwebtoken's own dependency.
         let bad_token = "!!!.payload.sig";
         let key = jsonwebtoken::DecodingKey::from_secret(b"unused");
         let validation = jsonwebtoken::Validation::default();
@@ -1881,26 +1754,11 @@ mod tests {
             &validation,
         )
         .unwrap_err();
-        // Verify it's actually a Base64 error.
         assert!(
             matches!(base64_err.kind(), ErrorKind::Base64(_)),
             "expected Base64 error, got: {base64_err:?}"
         );
-        let (code, _) = classify_jwt_error(
-            &base64_err,
-            &Credential::Header {
-                name: "authorization".into(),
-            },
-        );
-        assert_eq!(code, "auth.malformed_header");
-        let (code, _) = classify_jwt_error(&base64_err, &Credential::Cookie { name: "jwt".into() });
-        assert_eq!(code, "auth.malformed_credential");
-        let (code, _) = classify_jwt_error(
-            &base64_err,
-            &Credential::QueryParam {
-                name: "token".into(),
-            },
-        );
+        let (code, _) = classify_jwt_error(&base64_err);
         assert_eq!(code, "auth.malformed_credential");
     }
 
@@ -1919,10 +1777,9 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_jwt_from_a_query_param_reports_malformed_credential() {
         let resolver = resolver_on_query_param("token");
-        let payload =
-            IdentityPayload::new("", TokenSource::Bearer).with_raw_query_string("token=not-a-jwt");
+        let payload = IdentityPayload::new("", TokenSource::Bearer);
         assert_eq!(
-            deny_code_for(&resolver, payload).await,
+            deny_code_for_ext(&resolver, payload, ext_with_query("token=not-a-jwt")).await,
             "auth.malformed_credential",
         );
     }
@@ -1959,14 +1816,35 @@ mod tests {
     }
 
     async fn deny_code_for(resolver: &JwtIdentityResolver, payload: IdentityPayload) -> String {
+        deny_code_for_ext(resolver, payload, Extensions::default()).await
+    }
+
+    async fn deny_code_for_ext(
+        resolver: &JwtIdentityResolver,
+        payload: IdentityPayload,
+        ext: Extensions,
+    ) -> String {
         let r = resolver
-            .handle(&payload, &Extensions::default(), &mut PluginContext::new())
+            .handle(&payload, &ext, &mut PluginContext::new())
             .await;
         assert!(
             !r.continue_processing,
             "this input must deny, not fall through to allow"
         );
         r.violation.expect("a deny carries a violation").code
+    }
+
+    fn ext_with_query(qs: impl Into<String>) -> Extensions {
+        use crate::plugins::identity_jwt::resolver::tests::*;
+        Extensions {
+            http: Some(std::sync::Arc::new(
+                praxis_policy_core::extensions::HttpExtension {
+                    query: Some(qs.into()),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
@@ -1978,7 +1856,7 @@ mod tests {
             .with_headers(HashMap::from([("other".to_owned(), "v".to_owned())]));
         assert_eq!(
             deny_code_for(&resolver, payload).await,
-            "auth.malformed_header"
+            "auth.missing_credential"
         );
     }
 
@@ -1992,7 +1870,7 @@ mod tests {
             .with_headers(HashMap::from([("x-user-token".to_owned(), String::new())]));
         assert_eq!(
             deny_code_for(&resolver, payload).await,
-            "auth.malformed_header"
+            "auth.empty_credential"
         );
     }
 
@@ -2007,7 +1885,7 @@ mod tests {
                 "x-user-token".to_owned(),
                 jwt_with_payload(r#"{"iss":"https://nobody.example","sub":"alice"}"#),
             )]));
-        // The token is found (so not malformed_header) and rejected later for
+        // The token is found (so not missing_credential) and rejected later for
         // its issuer, which is what proves the lookup matched.
         assert_eq!(
             deny_code_for(&resolver, payload).await,
@@ -2059,7 +1937,7 @@ mod tests {
         let payload = IdentityPayload::new(token, TokenSource::Bearer).with_headers(headers);
         assert_eq!(
             deny_code_for(&resolver, payload).await,
-            "auth.malformed_header",
+            "auth.missing_credential",
             "with a populated header map the fallback must not fire"
         );
     }
@@ -2367,10 +2245,10 @@ mod tests {
     async fn a_query_param_credential_is_found_and_parsed() {
         let resolver = resolver_on_query_param("access_token");
         let token = jwt_with_payload(r#"{"iss":"https://nobody.example","sub":"alice"}"#);
-        let payload = IdentityPayload::new("", TokenSource::Bearer)
-            .with_raw_query_string(format!("access_token={token}"));
+        let payload = IdentityPayload::new("", TokenSource::Bearer);
+        let ext = ext_with_query(format!("access_token={token}"));
         assert_eq!(
-            deny_code_for(&resolver, payload).await,
+            deny_code_for_ext(&resolver, payload, ext).await,
             "auth.untrusted_issuer",
             "the token was found and parsed; only its issuer is untrusted"
         );
@@ -2389,10 +2267,9 @@ mod tests {
     #[tokio::test]
     async fn a_query_string_missing_the_configured_name_denies() {
         let resolver = resolver_on_query_param("access_token");
-        let payload =
-            IdentityPayload::new("", TokenSource::Bearer).with_raw_query_string("other=value");
+        let payload = IdentityPayload::new("", TokenSource::Bearer);
         assert_eq!(
-            deny_code_for(&resolver, payload).await,
+            deny_code_for_ext(&resolver, payload, ext_with_query("other=value")).await,
             "auth.missing_credential"
         );
     }
@@ -2400,10 +2277,9 @@ mod tests {
     #[tokio::test]
     async fn an_empty_query_param_value_denies() {
         let resolver = resolver_on_query_param("access_token");
-        let payload =
-            IdentityPayload::new("", TokenSource::Bearer).with_raw_query_string("access_token=");
+        let payload = IdentityPayload::new("", TokenSource::Bearer);
         assert_eq!(
-            deny_code_for(&resolver, payload).await,
+            deny_code_for_ext(&resolver, payload, ext_with_query("access_token=")).await,
             "auth.empty_credential"
         );
     }
@@ -2411,10 +2287,14 @@ mod tests {
     #[tokio::test]
     async fn a_duplicate_query_param_name_denies_as_ambiguous() {
         let resolver = resolver_on_query_param("access_token");
-        let payload = IdentityPayload::new("", TokenSource::Bearer)
-            .with_raw_query_string("access_token=one&access_token=two");
+        let payload = IdentityPayload::new("", TokenSource::Bearer);
         assert_eq!(
-            deny_code_for(&resolver, payload).await,
+            deny_code_for_ext(
+                &resolver,
+                payload,
+                ext_with_query("access_token=one&access_token=two"),
+            )
+            .await,
             "auth.ambiguous_credential"
         );
     }
@@ -2426,10 +2306,9 @@ mod tests {
     async fn an_oversized_query_string_denies_as_malformed() {
         let resolver = resolver_on_query_param("access_token");
         let oversized = format!("access_token={}", "x".repeat(9 * 1024));
-        let payload =
-            IdentityPayload::new("", TokenSource::Bearer).with_raw_query_string(oversized);
+        let payload = IdentityPayload::new("", TokenSource::Bearer);
         assert_eq!(
-            deny_code_for(&resolver, payload).await,
+            deny_code_for_ext(&resolver, payload, ext_with_query(oversized)).await,
             "auth.malformed_credential"
         );
     }
@@ -2437,10 +2316,9 @@ mod tests {
     #[tokio::test]
     async fn a_percent_encoded_query_param_name_denies_as_malformed() {
         let resolver = resolver_on_query_param("access_token");
-        let payload = IdentityPayload::new("", TokenSource::Bearer)
-            .with_raw_query_string("access%5Ftoken=eyJ.tok");
+        let payload = IdentityPayload::new("", TokenSource::Bearer);
         assert_eq!(
-            deny_code_for(&resolver, payload).await,
+            deny_code_for_ext(&resolver, payload, ext_with_query("access%5Ftoken=eyJ.tok"),).await,
             "auth.malformed_credential"
         );
     }
@@ -2448,10 +2326,14 @@ mod tests {
     #[tokio::test]
     async fn a_query_string_with_a_control_character_denies_as_malformed() {
         let resolver = resolver_on_query_param("access_token");
-        let payload = IdentityPayload::new("", TokenSource::Bearer)
-            .with_raw_query_string("access_token=eyJ\x0Btok");
+        let payload = IdentityPayload::new("", TokenSource::Bearer);
         assert_eq!(
-            deny_code_for(&resolver, payload).await,
+            deny_code_for_ext(
+                &resolver,
+                payload,
+                ext_with_query("access_token=eyJ\x0Btok"),
+            )
+            .await,
             "auth.malformed_credential"
         );
     }
@@ -2485,10 +2367,10 @@ mod tests {
 
         // Query-param path
         let resolver = resolver_on_query_param("access_token");
-        let payload = IdentityPayload::new("", TokenSource::Bearer)
-            .with_raw_query_string(format!("access_token={token}"));
+        let payload = IdentityPayload::new("", TokenSource::Bearer);
+        let qp_ext = ext_with_query(format!("access_token={token}"));
         let r = resolver
-            .handle(&payload, &Extensions::default(), &mut PluginContext::new())
+            .handle(&payload, &qp_ext, &mut PluginContext::new())
             .await;
         let reason = r
             .violation
@@ -2503,11 +2385,7 @@ mod tests {
     /// A token with no `iss` cannot be matched to a trusted issuer, so it is
     /// refused rather than checked against an arbitrary one.
     ///
-    /// The code is `auth.malformed_header`, which the source shares between "not
-    /// a well-formed JWT" and "no `iss` claim". Pinned as measured rather than as
-    /// expected: it is arguably the wrong code for a structurally valid token
-    /// that merely lacks a claim, and if that is ever split this test is where
-    /// the change surfaces.
+    /// A token with no `iss` claim cannot be matched to a trusted issuer.
     #[tokio::test]
     async fn a_token_with_no_issuer_claim_denies() {
         let resolver = resolver_on_header("authorization");
@@ -2515,19 +2393,18 @@ mod tests {
             IdentityPayload::new(jwt_with_payload(r#"{"sub":"alice"}"#), TokenSource::Bearer);
         assert_eq!(
             deny_code_for(&resolver, payload).await,
-            "auth.malformed_header"
+            "auth.malformed_credential"
         );
     }
 
-    /// Garbage that is not a JWT at all takes the same branch, which is why the
-    /// two cases currently share a code.
+    /// Garbage that is not a JWT at all takes the same branch.
     #[tokio::test]
     async fn a_token_that_is_not_a_jwt_denies() {
         let resolver = resolver_on_header("authorization");
         let payload = IdentityPayload::new("not-a-jwt", TokenSource::Bearer);
         assert_eq!(
             deny_code_for(&resolver, payload).await,
-            "auth.malformed_header"
+            "auth.malformed_credential"
         );
     }
 

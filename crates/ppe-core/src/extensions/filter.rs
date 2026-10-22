@@ -379,17 +379,6 @@ pub fn filter_extensions(extensions: &Extensions, capabilities: &HashSet<String>
     // Capability-gated: externally acquired metadata
     if extensions.metadata.is_some() {
         let policy = slot_policy(SlotName::Metadata);
-<<<<<<< HEAD
-=======
-        if has_read_access(&policy, capabilities) {
-            filtered.metadata = extensions.metadata.clone();
-        }
-    }
-
-    // Capability-gated: http
-    if extensions.http.is_some() {
-        let policy = slot_policy(SlotName::Http);
->>>>>>> 1cf76ed (feat: add immutable acquired metadata (#231))
         if has_read_access(&policy, capabilities) {
             filtered.metadata = extensions.metadata.clone();
         }

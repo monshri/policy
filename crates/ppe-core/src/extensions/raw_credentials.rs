@@ -653,6 +653,17 @@ mod tests {
     }
 
     #[test]
+    fn raw_inbound_token_rejects_legacy_source_header_string() {
+        let json = r#"{"source_header":"Authorization","kind":"jwt"}"#;
+        let err = serde_json::from_str::<RawInboundToken>(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing field") || msg.contains("source"),
+            "legacy source_header string should fail with a clear error: {msg}"
+        );
+    }
+
+    #[test]
     fn credential_display_formats() {
         assert_eq!(
             Credential::Header {

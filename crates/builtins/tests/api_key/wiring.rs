@@ -106,39 +106,27 @@ fn a_non_blocking_mode_or_ignored_error_fails_at_config_load() {
 }
 
 #[test]
-fn cookie_credential_is_rejected_at_config_load() {
+fn cookie_credential_builds_at_config_load() {
     let file = RecordFile::write(&format!(
         "keys:\n  - hash: \"{}\"\n    user: alice\n",
         hash("sk-secret")
     ));
     let mut block = file_config(file.path(), None);
     block["credential"] = serde_json::json!({ "kind": "cookie", "name": "__Host-jwt" });
-    let error = ApiKeyIdentityFactory
+    ApiKeyIdentityFactory
         .create(&plugin_config(block))
-        .err()
-        .expect("cookie credential must fail at load");
-    let msg = error.to_string();
-    assert!(
-        msg.contains("header credentials only"),
-        "expected 'header credentials only', got: {msg}"
-    );
+        .expect("cookie credential must build");
 }
 
 #[test]
-fn query_param_credential_is_rejected_at_config_load() {
+fn query_param_credential_builds_at_config_load() {
     let file = RecordFile::write(&format!(
         "keys:\n  - hash: \"{}\"\n    user: alice\n",
         hash("sk-secret")
     ));
     let mut block = file_config(file.path(), None);
     block["credential"] = serde_json::json!({ "kind": "query_param", "name": "api_key" });
-    let error = ApiKeyIdentityFactory
+    ApiKeyIdentityFactory
         .create(&plugin_config(block))
-        .err()
-        .expect("query_param credential must fail at load");
-    let msg = error.to_string();
-    assert!(
-        msg.contains("header credentials only"),
-        "expected 'header credentials only', got: {msg}"
-    );
+        .expect("query_param credential must build");
 }
