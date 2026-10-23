@@ -197,7 +197,6 @@ async fn persona_tokens_verify_against_the_published_jwks() {
         (&minted["iss"], &minted["aud"]),
         (&json!(idp::ISSUER), &json!(idp::GATEWAY_AUDIENCE))
     );
-    // `sign` is the path a test crafting its own claims takes.
     let user = idp::sign(&Persona::Bob.claims());
     let payload =
         IdentityPayload::new(String::new(), TokenSource::Bearer).with_headers(headers(&[
@@ -390,7 +389,6 @@ async fn the_fake_idp_rejects_missing_auth_and_malformed_grants() {
         }
         for index in 0..form.len() {
             for replacement in [None, Some("invalid")] {
-                // Audience and login_hint values are fixture inputs, not fixed enums.
                 if replacement.is_some() && matches!(form[index].0, "audience" | "login_hint") {
                     continue;
                 }
@@ -651,10 +649,6 @@ fn mcp_builders_match_the_filter_shapes() {
 // The reference host
 // -----------------------------------------------------------------------------
 
-// -----------------------------------------------------------------------------
-// The reference host
-// -----------------------------------------------------------------------------
-
 /// The Jane Smith record, which `server.py` answers with an SSN when asked.
 fn jane_with_ssn() -> Value {
     json!({ "employee_id": "EMP-001234", "include_ssn": true })
@@ -888,7 +882,6 @@ async fn a_secret_assertion_reaches_only_the_upstream_in_clear() {
         Some(&marker),
         "a later hook sees the marker, not the value"
     );
-    // A plugin holding read_headers sees the caller's own tokens, by design.
     let mut key_only = Planted::new();
     key_only.plant("vault-sourced api key", KEY);
     for (hook, headers) in &views {
@@ -1060,10 +1053,6 @@ async fn leak_checks_include_tokens_minted_before_a_denial() {
     assert_recorded_token(&mut out, minted, "access_token");
 }
 
-// ---------------------------------------------------------------------------
-// Cookie and query-param credential locations (end-to-end)
-// ---------------------------------------------------------------------------
-
 const HS256_SECRET: &str = "test-secret-at-least-32-bytes-long!!";
 
 const COOKIE_CONFIG: &str = r#"
@@ -1129,7 +1118,6 @@ fn standard_claims() -> Value {
     })
 }
 
-/// A JWT carried in a cookie resolves the user identity end-to-end.
 #[tokio::test]
 async fn cookie_credential_resolves_identity() {
     let engine = host::engine(Vec::new());
@@ -1149,7 +1137,6 @@ async fn cookie_credential_resolves_identity() {
     assert_eq!(subject.id.as_deref(), Some("cookie-user"));
 }
 
-/// A JWT carried in a query parameter resolves the user identity end-to-end.
 #[tokio::test]
 async fn query_param_credential_resolves_identity() {
     use praxis_policy_core::extensions::HttpExtension;
@@ -1176,10 +1163,6 @@ async fn query_param_credential_resolves_identity() {
     let subject = identity.subject.expect("a user subject");
     assert_eq!(subject.id.as_deref(), Some("cookie-user"));
 }
-
-// =====================================================================
-// Query-param JWT + http.query policy from the same request
-// =====================================================================
 
 mod query_identity_and_policy {
     use super::*;
@@ -1336,10 +1319,6 @@ mod query_identity_and_policy {
     }
 }
 
-// =====================================================================
-// Capability isolation: read_query vs read_headers
-// =====================================================================
-
 mod query_capability_isolation {
     use praxis_policy_core::extensions::HttpExtension;
     use praxis_policy_core::extensions::filter::filter_extensions;
@@ -1420,4 +1399,67 @@ mod query_capability_isolation {
             "round-trip must recover the placeholder, not the value"
         );
     }
+}
+
+/// Load a document with one CIBA plugin whose `store` is omitted for `None`.
+fn load_ciba_store(store: Option<&str>, global: &str) -> Result<(), String> {
+    let engine = Arc::new(PolicyEngine::default());
+    praxis_policy::install_builtins(&engine);
+    let store = store.map_or(String::new(), |s| format!("      store: {s}\n"));
+    engine
+        .load_config_yaml(&format!(
+            "
+plugins:
+  - name: manager-approver
+    kind: elicitation/ciba
+    hooks: [elicit]
+    capabilities: [perform_http]
+    config:
+      backchannel_endpoint: https://idp.example/ciba/auth
+      token_endpoint: https://idp.example/token
+      client_id: praxis-policy-gateway
+      client_secret_source: {{ kind: literal, secret: shh }}
+{store}routes:
+  - tool: approve_raise
+    authorization:
+      pre_invocation:
+        - 'require_approval(manager-approver, from: claim.manager, purpose: \"Approve\")'
+{global}"
+        ))
+        .map_err(|e| e.to_string())
+}
+
+const VALKEY_GLOBAL: &str =
+    "global:\n  session_store:\n    kind: valkey\n    endpoint: localhost:6379\n";
+
+#[test]
+fn an_omitted_ciba_store_fails_even_with_a_valkey_session_store() {
+    for global in ["", VALKEY_GLOBAL] {
+        let err = load_ciba_store(None, global).expect_err("store choice is required");
+        assert!(err.contains("store"), "global={global:?}: {err}");
+    }
+}
+
+#[test]
+fn an_explicit_memory_store_loads() {
+    load_ciba_store(Some("{ kind: memory }"), "").expect("load");
+}
+
+#[test]
+fn a_ciba_store_can_reference_the_valkey_session_store() {
+    load_ciba_store(
+        Some("{ kind: valkey, connection: session_store, key_prefix: ciba:v1, password: ciba-secret }"),
+        VALKEY_GLOBAL,
+    )
+    .expect("the reference resolves against global.session_store");
+}
+
+#[test]
+fn a_ciba_store_reference_without_a_valkey_session_store_fails_to_load() {
+    let err = load_ciba_store(Some("{ kind: valkey, connection: session_store }"), "")
+        .expect_err("nothing to reference");
+    assert!(
+        err.contains("manager-approver") && err.contains("global.session_store"),
+        "{err}"
+    );
 }

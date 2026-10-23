@@ -122,12 +122,6 @@ fn a_map_with_no_section_for_the_role_fails_at_config_load() {
     );
 }
 
-/// The presented credential stops at this plugin. Nothing downstream can
-/// forward a caller's own key to an upstream that never authenticated it.
-///
-/// Scoped to what this resolver writes. The inbound header map is
-/// `#[serde(skip)]` on `IdentityPayload`, so credentials in headers
-/// do not reach serialized output.
 #[tokio::test]
 async fn the_presented_credential_never_reaches_raw_credentials() {
     let file = RecordFile::write(&format!(
