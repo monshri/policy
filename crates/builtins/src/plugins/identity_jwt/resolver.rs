@@ -49,6 +49,9 @@
 //   * `auth.mapping_failed` — claim mapper rejected the claims
 //   * `auth.config_error` — issuer config was emptied after load (`audiences`)
 //   * `auth.token_invalid` — any other validation failure
+//   * `auth.dpop_missing`, `auth.dpop_invalid`, `auth.dpop_key_mismatch`,
+//     `auth.dpop_replay`, `auth.dpop_replay_unavailable` — see
+//     [`dpop::codes`](crate::plugins::identity_jwt::dpop::codes)
 
 use std::sync::Arc;
 
@@ -70,10 +73,16 @@ use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
 use crate::plugins::identity_jwt::KIND;
 use crate::plugins::identity_jwt::claim_map::JWT_MAPPING_PROFILE;
+use crate::plugins::identity_jwt::config::DpopMode;
 use crate::plugins::identity_jwt::config::{
     JwksFetch, JwksFetchBudget, JwtIdentityResolverConfig, KeySourceError, TrustedIssuerConfig,
 };
+use crate::plugins::identity_jwt::dpop::{
+    DpopVerifier, InMemoryReplayGuard, PopDenial, PopRequest, ProofOfPossession as _, ReplayGuard,
+    codes as dpop_codes,
+};
 use crate::plugins::identity_jwt::presets;
+use praxis_policy_core::extensions::{HttpExtension, KeyBinding};
 use praxis_policy_core::identity::mapping::ConfiguredClaimMap;
 use praxis_policy_core::identity::mapping::{ClaimMap, ClaimMapper};
 use praxis_policy_core::identity::mapping::{ClaimsOverrides, CompiledClaimsOverrides};
@@ -139,6 +148,9 @@ pub struct JwtIdentityResolver {
     /// `RawInboundToken.source` so forwarding plugins know where to
     /// put it (or strip it) on the upstream call.
     location: CredentialLocation,
+    /// Remembers accepted `DPoP` proof ids. Uses an in-memory guard by default;
+    /// hosts can inject a shared guard for replay detection across instances.
+    replay: Arc<dyn ReplayGuard>,
 }
 
 // Implement `Debug` manually because `cfg` and `pending_jwks` may contain HMAC
@@ -149,6 +161,7 @@ impl std::fmt::Debug for JwtIdentityResolver {
             .field("name", &self.cfg.name)
             .field("role", &self.role)
             .field("location", &self.location)
+            .field("replay", &self.replay)
             .field("pending_jwks_count", &self.pending_jwks.len())
             .field("cfg", &"<redacted>")
             .field("pending_jwks", &"<redacted>")
@@ -172,6 +185,20 @@ impl JwtIdentityResolver {
     /// not deserialize into this plugin's settings, and when a validated field
     /// is out of range.
     pub fn new(cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
+        Self::with_replay_guard(cfg, Arc::new(InMemoryReplayGuard::default()))
+    }
+
+    /// Build a resolver with a host-owned replay guard. Hosts running more
+    /// than one gateway instance must pass guards backed by the same atomic
+    /// store so a proof accepted by one instance is refused by the others.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PluginError::Config` for invalid resolver or issuer settings.
+    pub fn with_replay_guard(
+        cfg: PluginConfig,
+        replay: Arc<dyn ReplayGuard>,
+    ) -> Result<Self, Box<PluginError>> {
         let raw_config = cfg.config.as_ref().ok_or_else(|| {
             Box::new(PluginError::Config {
                 message: format!(
@@ -189,12 +216,47 @@ impl JwtIdentityResolver {
                 })
             })?;
 
+        let mut seen_issuers = std::collections::HashSet::new();
+        if let Some(dup) = typed
+            .trusted_issuers
+            .iter()
+            .find(|i| !seen_issuers.insert(i.issuer.as_str()))
+        {
+            return Err(Box::new(PluginError::Config {
+                message: format!(
+                    "plugin '{}' ({KIND}): trusted_issuer '{}' is listed more than once; a \
+                     token is matched to an issuer by `iss`, so only one entry could apply",
+                    cfg.name, dup.issuer
+                ),
+            }));
+        }
+
         if typed.trusted_issuers.is_empty() {
             return Err(Box::new(PluginError::Config {
                 message: format!(
                     "plugin '{}' ({KIND}) requires at least one \
                      entry in `trusted_issuers`",
                     cfg.name
+                ),
+            }));
+        }
+
+        // A DPoP proof names the request's method and URL, which the resolver
+        // reads from the request line. The host hands that over only to a plugin
+        // granted `read_headers`, so without it every bound token would be
+        // denied. Refuse at load instead.
+        if let Some(issuer) = typed
+            .trusted_issuers
+            .iter()
+            .find(|i| i.dpop.mode != DpopMode::Off)
+            && !cfg.capabilities.contains("read_headers")
+        {
+            return Err(Box::new(PluginError::Config {
+                message: format!(
+                    "plugin '{}' ({KIND}): trusted_issuer '{}' turns on dpop, which checks \
+                     the request's method and URL; grant the plugin the `read_headers` \
+                     capability",
+                    cfg.name, issuer.issuer
                 ),
             }));
         }
@@ -364,6 +426,7 @@ impl JwtIdentityResolver {
             claim_mapper,
             role: typed.role,
             location,
+            replay,
         })
     }
 }
@@ -501,6 +564,7 @@ impl Plugin for JwtIdentityResolver {
                         keys: Arc::new(std::sync::RwLock::new(KeyStore::empty())),
                         algorithms: cfg.algorithms.clone(),
                         leeway_seconds: cfg.leeway_seconds,
+                        dpop: cfg.dpop.clone(),
                         // Carrying the source is what makes the empty
                         // store recoverable: the first verify that needs
                         // a key will re-fetch rather than denying for the
@@ -718,12 +782,12 @@ impl JwtIdentityResolver {
         &self,
         payload: &IdentityPayload,
         ext: &Extensions,
-    ) -> Result<String, Box<PluginViolation>> {
+    ) -> Result<(AuthScheme, String), Box<PluginViolation>> {
         if matches!(self.location.credential, Credential::Header { .. })
             && payload.headers().is_empty()
             && !payload.raw_token().is_empty()
         {
-            return Ok(payload.raw_token().to_owned());
+            return Ok((AuthScheme::PreExtracted, payload.raw_token().to_owned()));
         }
 
         let raw = self
@@ -765,9 +829,10 @@ impl JwtIdentityResolver {
             })?;
 
         if matches!(self.location.credential, Credential::Header { .. }) {
-            Ok(strip_bearer_prefix(&raw).to_owned())
+            let (scheme, token) = split_auth_scheme(&raw);
+            Ok((scheme, token.to_owned()))
         } else {
-            Ok(raw)
+            Ok((AuthScheme::Unspecified, raw))
         }
     }
 }
@@ -779,7 +844,7 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
         ext: &Extensions,
         _ctx: &mut PluginContext,
     ) -> PluginResult<IdentityPayload> {
-        let raw_token = match self.extract_token(payload, ext) {
+        let (scheme, raw_token) = match self.extract_token(payload, ext) {
             Ok(t) => t,
             Err(violation) => return PluginResult::deny(*violation),
         };
@@ -920,12 +985,29 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
             },
         };
 
-        // 3. Build the updated payload by mapping claims into the
-        //    typed slot for our configured role.
+        // 3. Proof of possession, for an issuer that binds tokens to keys.
+        //    After validation, so a forged token never reaches the replay
+        //    store, and before mapping, so a failed proof leaves no identity.
+        let key_binding = match self
+            .check_key_binding(issuer, scheme, &raw_token, &token_data.claims, payload, ext)
+            .await
+        {
+            Ok(binding) => binding,
+            Err(denial) => {
+                return PluginResult::deny(PluginViolation::new(denial.code, denial.reason));
+            },
+        };
+
+        // 4. Build the updated payload by mapping claims into the
+        //    typed slot for our configured role, recording the verified
+        //    key binding on that slot.
         let mut updated = payload.clone();
         match &self.role {
             TokenRole::User => match self.claim_mapper.map_subject(&token_data.claims) {
-                Some(s) => updated.subject = Some(s),
+                Some(mut s) => {
+                    s.key_binding = key_binding;
+                    updated.subject = Some(s);
+                },
                 None => {
                     return PluginResult::deny(PluginViolation::new(
                         "auth.mapping_failed",
@@ -937,7 +1019,10 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
                 },
             },
             TokenRole::Client => match self.claim_mapper.map_client(&token_data.claims) {
-                Some(c) => updated.client = Some(c),
+                Some(mut c) => {
+                    c.key_binding = key_binding;
+                    updated.client = Some(c);
+                },
                 None => {
                     return PluginResult::deny(PluginViolation::new(
                         "auth.mapping_failed",
@@ -949,7 +1034,10 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
                 },
             },
             TokenRole::CallerWorkload => match self.claim_mapper.map_workload(&token_data.claims) {
-                Some(w) => updated.caller_workload = Some(w),
+                Some(mut w) => {
+                    w.key_binding = key_binding;
+                    updated.caller_workload = Some(w);
+                },
                 None => {
                     return PluginResult::deny(PluginViolation::new(
                         "auth.mapping_failed",
@@ -980,7 +1068,7 @@ impl HookHandler<IdentityHook> for JwtIdentityResolver {
             },
         }
 
-        // 4. Stash the raw token for forwarding plugins. Key the
+        // 5. Stash the raw token for forwarding plugins. Key the
         //    stash by the resolver's configured role so multi-token
         //    deployments (user + client + workload) keep each
         //    credential addressable.
@@ -1040,16 +1128,163 @@ fn peek_issuer(token: &str) -> Option<String> {
     value.get("iss")?.as_str().map(String::from)
 }
 
-/// Strip a leading `Bearer` auth-scheme from a header value, if present.
+/// The resolver's configuration-fault code, shared with the other checks that
+/// discover a misconfiguration at request time.
+const CONFIG_ERROR: &str = "auth.config_error";
+
+/// How the token was presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthScheme {
+    /// `Bearer <token>`.
+    Bearer,
+    /// `DPoP <token>` ([RFC 9449 Section 7.1]).
+    ///
+    /// [RFC 9449 Section 7.1]: https://datatracker.ietf.org/doc/html/rfc9449#section-7.1
+    Dpop,
+    /// A bare token in the configured header.
+    Unspecified,
+    /// The host supplied a token without its original authorization scheme.
+    PreExtracted,
+}
+
+/// Split a leading `Bearer` or `DPoP` auth-scheme from a header value.
 ///
-/// The scheme is case-insensitive per RFC 9110 §11.1. Bare tokens are returned
-/// unchanged for hosts that strip the scheme themselves.
-fn strip_bearer_prefix(value: &str) -> &str {
+/// Schemes are case-insensitive per [RFC 9110 Section 11.1]. Bare tokens in
+/// the configured header are returned unchanged as `Unspecified`.
+///
+/// [RFC 9110 Section 11.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
+fn split_auth_scheme(value: &str) -> (AuthScheme, &str) {
     match value.split_once(' ') {
         Some((scheme, after)) if scheme.eq_ignore_ascii_case("bearer") => {
-            after.trim_start_matches(' ')
+            (AuthScheme::Bearer, after.trim_start_matches(' '))
         },
-        _ => value,
+        Some((scheme, after)) if scheme.eq_ignore_ascii_case("dpop") => {
+            (AuthScheme::Dpop, after.trim_start_matches(' '))
+        },
+        _ => (AuthScheme::Unspecified, value),
+    }
+}
+
+/// The URL the client addressed: the configured external base plus the request
+/// path, or the request's own scheme, host and path.
+fn request_url(http: &HttpExtension, external_base_url: Option<&str>) -> Result<String, String> {
+    let path = http.path.as_deref().ok_or_else(|| {
+        "the host supplied no request path, so a DPoP proof's htu cannot be checked".to_owned()
+    })?;
+    let path = path.split(['?', '#']).next().unwrap_or("/");
+    if let Some(base) = external_base_url {
+        return Ok(format!("{}{path}", base.trim_end_matches('/')));
+    }
+    match (http.scheme.as_deref(), http.host.as_deref()) {
+        (Some(scheme), Some(host)) => Ok(format!("{scheme}://{host}{path}")),
+        _ => Err(
+            "the host supplied no request scheme and host, so a DPoP proof's htu \
+                  cannot be checked; set dpop.external_base_url on the issuer"
+                .to_owned(),
+        ),
+    }
+}
+
+impl JwtIdentityResolver {
+    /// Apply the issuer's `DPoP` setting to a validated token.
+    ///
+    /// Returns the verified binding, `None` for a token accepted without one,
+    /// or the denial.
+    async fn check_key_binding(
+        &self,
+        issuer: &TrustedIssuer,
+        scheme: AuthScheme,
+        token: &str,
+        claims: &ClaimMap,
+        payload: &IdentityPayload,
+        ext: &Extensions,
+    ) -> Result<Option<KeyBinding>, PopDenial> {
+        let denial = |code: &'static str, reason: String| PopDenial { code, reason };
+        if issuer.dpop.mode == DpopMode::Off {
+            if scheme == AuthScheme::Dpop {
+                return Err(denial(
+                    dpop_codes::DPOP_INVALID,
+                    format!(
+                        "issuer '{}' is not configured for DPoP, so a token presented with the \
+                         DPoP scheme cannot have its proof checked",
+                        issuer.issuer
+                    ),
+                ));
+            }
+            return Ok(None);
+        }
+
+        // A token whose `cnf` is present but carries no usable `jkt` is bound
+        // to something this check cannot verify: a malformed `jkt`, or another
+        // method such as a certificate (`x5t#S256`). Treating it as unbound
+        // would accept a bound token as a bearer token, so it is denied.
+        let cnf = claims.get("cnf");
+        let bound_thumbprint = cnf.and_then(|c| c.get("jkt")).and_then(Value::as_str);
+        if cnf.is_some() && bound_thumbprint.is_none() {
+            return Err(denial(
+                dpop_codes::DPOP_INVALID,
+                "the token carries a cnf claim with no usable jkt, so it is bound in a way \
+                 this issuer's DPoP check cannot verify"
+                    .to_owned(),
+            ));
+        }
+        let Some(bound_thumbprint) = bound_thumbprint else {
+            if scheme == AuthScheme::Dpop {
+                return Err(denial(
+                    dpop_codes::DPOP_INVALID,
+                    "the token was presented with the DPoP scheme but is not bound to a key \
+                     (no cnf.jkt)"
+                        .to_owned(),
+                ));
+            }
+            if issuer.dpop.mode == DpopMode::Required {
+                return Err(denial(
+                    dpop_codes::DPOP_MISSING,
+                    format!(
+                        "issuer '{}' requires DPoP-bound tokens and this token carries no cnf.jkt",
+                        issuer.issuer
+                    ),
+                ));
+            }
+            return Ok(None);
+        };
+        if matches!(scheme, AuthScheme::Bearer | AuthScheme::Unspecified) {
+            return Err(denial(
+                dpop_codes::DPOP_MISSING,
+                "the token is bound to a key but was not presented with the DPoP scheme; present \
+                 it with the DPoP scheme and a proof"
+                    .to_owned(),
+            ));
+        }
+
+        // The three faults below are the host's or the configuration's, not the
+        // client's, so they carry the resolver's existing configuration code.
+        let Some(http) = ext.http.as_deref() else {
+            return Err(denial(
+                CONFIG_ERROR,
+                "the host supplied no request line, so a DPoP proof cannot be checked".to_owned(),
+            ));
+        };
+        let Some(method) = http.method.as_deref() else {
+            return Err(denial(
+                CONFIG_ERROR,
+                "the host supplied no request method, so a DPoP proof cannot be checked".to_owned(),
+            ));
+        };
+        let url = request_url(http, issuer.dpop.external_base_url.as_deref())
+            .map_err(|reason| denial(CONFIG_ERROR, reason))?;
+
+        let verifier = DpopVerifier::new(&issuer.dpop, self.replay.as_ref());
+        let request = PopRequest {
+            issuer: &issuer.issuer,
+            access_token: token,
+            bound_thumbprint,
+            proof: payload.headers().get("dpop").map(String::as_str),
+            method,
+            url: &url,
+            now: chrono::Utc::now().timestamp(),
+        };
+        verifier.verify(&request).await.map(Some)
     }
 }
 
@@ -1263,6 +1498,7 @@ mod tests {
             ))),
             algorithms: vec![],
             leeway_seconds: 0,
+            dpop: crate::plugins::identity_jwt::config::DpopConfig::default(),
             source: crate::plugins::identity_jwt::config::DecodingKeySource::Secret {
                 secret: "k".into(),
             },
@@ -1293,6 +1529,7 @@ mod tests {
             ))),
             algorithms: vec![jsonwebtoken::Algorithm::HS256],
             leeway_seconds: 0,
+            dpop: crate::plugins::identity_jwt::config::DpopConfig::default(),
             source: crate::plugins::identity_jwt::config::DecodingKeySource::Secret {
                 secret: "k".into(),
             },
@@ -1325,6 +1562,7 @@ mod tests {
                 keys: Arc::clone(&current.keys),
                 algorithms: current.algorithms.clone(),
                 leeway_seconds: current.leeway_seconds,
+                dpop: crate::plugins::identity_jwt::config::DpopConfig::default(),
                 source: current.source.clone(),
                 refresh: crate::plugins::identity_jwt::trusted_issuer::RefreshGate::default(),
             };
@@ -1338,14 +1576,18 @@ mod tests {
     }
 
     #[test]
-    fn strip_bearer_prefix_is_case_insensitive() {
-        assert_eq!(strip_bearer_prefix("Bearer abc.def.ghi"), "abc.def.ghi");
-        assert_eq!(strip_bearer_prefix("bearer abc.def.ghi"), "abc.def.ghi");
-        assert_eq!(strip_bearer_prefix("BEARER abc.def.ghi"), "abc.def.ghi");
-        assert_eq!(strip_bearer_prefix("BeArEr abc.def.ghi"), "abc.def.ghi");
-        assert_eq!(strip_bearer_prefix("bearer   abc.def.ghi"), "abc.def.ghi");
-        assert_eq!(strip_bearer_prefix("abc.def.ghi"), "abc.def.ghi");
-        assert_eq!(strip_bearer_prefix("bearerish"), "bearerish");
+    fn split_auth_scheme_is_case_insensitive() {
+        let token = |v: &'static str| split_auth_scheme(v).1;
+        assert_eq!(token("Bearer abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(token("bearer abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(token("BEARER abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(token("BeArEr abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(token("bearer   abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(token("abc.def.ghi"), "abc.def.ghi");
+        assert_eq!(token("bearerish"), "bearerish");
+        assert_eq!(split_auth_scheme("DPoP abc").0, AuthScheme::Dpop);
+        assert_eq!(split_auth_scheme("dpop abc"), (AuthScheme::Dpop, "abc"));
+        assert_eq!(split_auth_scheme("abc").0, AuthScheme::Unspecified);
     }
 
     #[test]
@@ -2948,6 +3190,7 @@ mod tests {
             keys: std::sync::Arc::new(std::sync::RwLock::new(KeyStore::empty())),
             algorithms: vec![jsonwebtoken::Algorithm::HS256],
             leeway_seconds: 0,
+            dpop: crate::plugins::identity_jwt::config::DpopConfig::default(),
             source: crate::plugins::identity_jwt::config::DecodingKeySource::Secret {
                 secret: "k".into(),
             },
@@ -2978,6 +3221,7 @@ mod tests {
             )]))),
             algorithms: vec![jsonwebtoken::Algorithm::HS256],
             leeway_seconds: 0,
+            dpop: crate::plugins::identity_jwt::config::DpopConfig::default(),
             source: crate::plugins::identity_jwt::config::DecodingKeySource::Secret {
                 secret: "k".into(),
             },
