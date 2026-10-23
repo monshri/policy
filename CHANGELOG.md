@@ -70,6 +70,54 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   Route predicates read `metadata.*` without a host grant: the synthetic APL
   handler holds `read_metadata` intrinsically.
 
+- **Typed credential locations for the `identity/jwt` plugin.** The plugin can
+  now extract bearer JWTs from HTTP headers, cookies, or query parameters — one
+  location per resolver instance. A new `credential:` config block names a
+  `kind` (`header`, `cookie`, or `query_param`) and a `name`. Cookie and
+  query-string values are parsed by PPE itself (`ppe-core::http_credential`),
+  not by whichever HTTP framework the host runs, so the same request resolves
+  the same credential regardless of which proxy sits in front of it. DPoP
+  requires a header credential; cookie and query parameter locations are
+  refused at load when an issuer enables DPoP.
+  **Breaking for existing config** — `header:` is removed with no alias:
+
+  ```yaml
+  # Before
+  plugins:
+    - name: user-jwt
+      kind: identity/jwt
+      config:
+        header: "Authorization"
+        trusted_issuers: [...]
+
+  # After
+  plugins:
+    - name: user-jwt
+      kind: identity/jwt
+      config:
+        credential:
+          kind: header
+          name: Authorization
+        trusted_issuers: [...]
+  ```
+
+  Omitting `credential:` entirely still defaults to the `Authorization` header,
+  so a config that never set `header:` needs no change.
+
+  Runtime deny codes for credential extraction: `auth.missing_credential` (no
+  `Cookie` header or query string supplied), `auth.empty_credential` (name
+  found but value empty), `auth.ambiguous_credential` (duplicate cookie or
+  query-parameter name), `auth.malformed_credential` (parse failure — oversized
+  input or control characters). Malformed JWTs use
+  `auth.malformed_credential` at every credential location.
+
+  **Security note**: a resolver configured for `credential: { kind: query_param
+  }` logs a one-time notice at construction, because a query-parameter token
+  routinely appears in infrastructure logs (access logs, CDN logs, browser
+  history) outside PPE's control — PPE's own logging never prints the token
+  value, in either the old or the new field.
+  ([#64](https://github.com/praxis-proxy/policy/issues/64))
+
 ### Changed
 
 - **Breaking for the reference audit plugins:** `audit/logger` requires
@@ -110,6 +158,34 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   `Capability` adds `ReadMetadata` and `SlotName` adds `Metadata`, so
   exhaustive matches need a new arm. `Extensions.metadata` is never
   serialized. The new metadata enums are `#[non_exhaustive]`.
+
+### Removed
+
+- **The `identity/jwt` plugin's `header:` config field.** Replaced by the
+  `credential:` block (see Added). A config still writing `header:` fails
+  the load as the unrecognized field it now is.
+
+  **Breaking for embedders**: `RawInboundToken.source_header: String` is
+  replaced by `RawInboundToken.source: Credential`, and its constructor becomes
+  `RawInboundToken::new(token, source: Credential, kind)`. The serialized JSON
+  shape changes from `{"source_header":"Authorization"}` to
+  `{"source":{"kind":"header","name":"Authorization"}}` — the value is now a
+  `Credential` object, not a plain string, so persisted or wire JSON using the
+  old shape must be migrated. `Credential` (in
+  `praxis_policy_core::extensions`) is the new shared type recording where any
+  identity plugin — this one, or a future X.509/mTLS or WIMSE Proof Token
+  resolver — extracted a credential from, so downstream consumers (audit
+  logging, assertion propagation, policy predicates) read one uniform type
+  regardless of which plugin produced it. `RawInboundToken`'s `Debug`
+  continues to redact the token.
+
+  `IdentityPayload.headers` is now `#[serde(skip)]` — the field is no longer
+  included in serialized output. Previously it was `skip_serializing_if =
+  "HashMap::is_empty"`, which could include request headers in serialized
+  payloads when non-empty. Headers may carry credentials and must not appear
+  in serialized output. Out-of-process hosts that relied on receiving headers
+  through serialized `IdentityPayload` should read them from the input request
+  directly.
 
 ## [0.5.0] - 2026-10-13
 
@@ -581,51 +657,6 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 - **Roles and permissions are readable as whole sets.** `subject.roles`, `subject.permissions`, `client.roles`, and `client.permissions` join `subject.teams` as `StringSet` bag keys, so a policy can write `"hr" in subject.roles` rather than enumerating `role.<name>` booleans. The flattened boolean keys are unchanged. ([#7](https://github.com/praxis-proxy/policy/pull/7))
 
-- **Typed credential locations for the `identity/jwt` plugin.** The plugin can
-  now extract bearer JWTs from HTTP headers, cookies, or query parameters — one
-  location per resolver instance. A new `credential:` config block names a
-  `kind` (`header`, `cookie`, or `query_param`) and a `name`. Cookie and
-  query-string values are parsed by PPE itself (`ppe-core::http_credential`),
-  not by whichever HTTP framework the host runs, so the same request resolves
-  the same credential regardless of which proxy sits in front of it.
-  **Breaking for existing config** — `header:` is removed with no alias:
-
-  ```yaml
-  # Before
-  plugins:
-    - name: user-jwt
-      kind: identity/jwt
-      config:
-        header: "Authorization"
-        trusted_issuers: [...]
-
-  # After
-  plugins:
-    - name: user-jwt
-      kind: identity/jwt
-      config:
-        credential:
-          kind: header
-          name: Authorization
-        trusted_issuers: [...]
-  ```
-
-  Omitting `credential:` entirely still defaults to the `Authorization` header,
-  so a config that never set `header:` needs no change.
-
-  Runtime deny codes for credential extraction: `auth.missing_credential` (no
-  `Cookie` header or query string supplied), `auth.empty_credential` (name
-  found but value empty), `auth.ambiguous_credential` (duplicate cookie or
-  query-parameter name), `auth.malformed_credential` (parse failure — oversized
-  input or control characters). Header extraction continues to use
-  `auth.malformed_header`.
-
-  **Security note**: a resolver configured for `credential: { kind: query_param
-  }` logs a one-time notice at construction, because a query-parameter token
-  routinely appears in infrastructure logs (access logs, CDN logs, browser
-  history) outside PPE's control — PPE's own logging never prints the token
-  value, in either the old or the new field.
-  ([#64](https://github.com/praxis-proxy/policy/issues/64))
 
 ### Changed
 
@@ -808,31 +839,6 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 - **`AplRouteHandler::with_pdp_router` is gone.** Install a `PdpRouter` through `with_pdp`, which is what the visitor already does. ([#13](https://github.com/praxis-proxy/policy/issues/13))
 
-- **The `identity/jwt` plugin's `header:` config field.** Replaced by the
-  `credential:` block (see Added). A config still writing `header:` fails
-  the load as the unrecognized field it now is.
-
-  **Breaking for embedders**: `RawInboundToken.source_header: String` is
-  replaced by `RawInboundToken.source: Credential`, and its constructor becomes
-  `RawInboundToken::new(token, source: Credential, kind)`. The serialized JSON
-  shape changes from `{"source_header":"Authorization"}` to
-  `{"source":{"kind":"header","name":"Authorization"}}` — the value is now a
-  `Credential` object, not a plain string, so persisted or wire JSON using the
-  old shape must be migrated. `Credential` (in
-  `praxis_policy_core::extensions`) is the new shared type recording where any
-  identity plugin — this one, or a future X.509/mTLS or WIMSE Proof Token
-  resolver — extracted a credential from, so downstream consumers (audit
-  logging, assertion propagation, policy predicates) read one uniform type
-  regardless of which plugin produced it. `RawInboundToken`'s `Debug` is now
-  hand-written rather than derived, and redacts the token in both cases.
-
-  `IdentityPayload.headers` is now `#[serde(skip)]` — the field is no longer
-  included in serialized output. Previously it was `skip_serializing_if =
-  "HashMap::is_empty"`, which could include request headers in serialized
-  payloads when non-empty. Headers may carry credentials and must not appear
-  in serialized output. Out-of-process hosts that relied on receiving headers
-  through serialized `IdentityPayload` should read them from the input request
-  directly.
 
 ### Fixed
 

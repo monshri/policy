@@ -2,7 +2,21 @@
 
 ## Context
 
-The JWT identity plugin (`builtins/plugins/identity-jwt/`) currently only extracts JWTs from HTTP headers. Issue #64 requests support for cookies and query parameters — one location per resolver instance. The old `header: "Authorization"` config field is removed; all configs must use the new `credential` block.
+The JWT identity plugin originally extracted JWTs only from HTTP headers.
+Issue #64 requested cookie and query parameter support, with one location per
+resolver instance. The former `header` config field is removed; configs can
+use `credential` or omit it to select the default Authorization header.
+
+## Implementation outcome
+
+This document records the original plan. The implemented contract uses
+`HttpExtension.query` as the host-supplied raw query string, gated by the
+`read_query` capability. It does not add `IdentityPayload.raw_query_string`.
+The cookie and query parsers cap raw input at 16 KiB, reject control
+characters, and reject duplicate configured credential names. The resolver
+reports missing, empty, ambiguous, and malformed inputs with distinct deny
+codes. The sections below retain the planning sketches for historical context;
+use the API documentation and `docs/content/` for the current interface.
 
 ## Config Format Examples
 

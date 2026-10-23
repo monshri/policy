@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-// Shared credential location and extraction types for identity plugins.
-//
-// `CredentialLocation` pairs a wire location (`Credential`) with an
-// optional prefix gate. `Extraction` reports what reading that location
-// produced. Both are plugin-neutral — any identity resolver (JWT,
-// API key, future mTLS/WIMSE) imports them from here rather than
-// defining its own extraction types.
-
 use std::collections::HashMap;
 
 use crate::extensions::raw_credentials::Credential;
@@ -17,20 +9,9 @@ use crate::http_credential;
 
 /// Where the credential sits, and what marks it as this resolver's.
 ///
-/// Built from two sibling config keys rather than deserialized as one
-/// block. `credential:` is then exactly the `Credential` with nothing
-/// wrapped around it, and `prefix:` sits beside it.
-///
-/// The prefix does two jobs. It tells a resolver whether a credential
-/// is one it services at all, so several key populations can share a
-/// route without every lookup querying every directory. And it is
-/// stripped before the lookup, because the stored record is keyed by
-/// the key and not by the transport framing around it.
-///
-/// A prefix with a space splits into an auth scheme and a leader. The
-/// **scheme** is transport framing — case-insensitive and stripped. The
-/// **leader** is part of the credential — required and kept. See the
-/// `prefix` field docs for the full rule.
+/// Use a prefix to select which resolver handles a credential when several
+/// key populations share a route. The prefix may include an auth scheme,
+/// which is stripped before the key is presented for lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialLocation {
     /// The wire location.
@@ -38,24 +19,11 @@ pub struct CredentialLocation {
 
     /// What the value must start with to be one this resolver services.
     ///
-    /// A space splits it into an auth scheme and a leader, which are
-    /// treated differently because they are different things.
-    ///
-    /// The **scheme** is transport framing, so it is stripped, and
-    /// RFC 7235 makes it case-insensitive with any run of spaces after
-    /// it: `Bearer`, `bearer` and `BEARER` are one scheme, and
-    /// `bearer   sk-oai-x` is well formed.
-    ///
-    /// The **leader** is part of the credential, so it is required and
-    /// kept. `sk-oai-` in a `MaaS` key is the key's own first seven
-    /// characters and the record is stored under a digest of the whole
-    /// string, so stripping it would hash the wrong thing.
-    ///
-    /// So `Bearer sk-oai-` against `Bearer sk-oai-abc` looks up
-    /// `sk-oai-abc`.
-    ///
-    /// A prefix with no space is all leader. Absent means every value
-    /// at that location is a candidate.
+    /// A prefix such as `Bearer sk-oai-` accepts `Bearer sk-oai-abc` and
+    /// yields `sk-oai-abc`. The auth scheme is case-insensitive; the key
+    /// leader is case-sensitive and stays in the presented credential.
+    /// A prefix without a space is entirely a key leader. `None` accepts
+    /// every value at the configured location.
     pub prefix: Option<String>,
 }
 
@@ -114,7 +82,6 @@ fn map_parse_error(e: http_credential::CredentialParseError) -> Extraction {
     use http_credential::CredentialParseError;
     match e {
         CredentialParseError::Duplicate { .. } => Extraction::Ambiguous,
-        CredentialParseError::PercentEncodedName { .. } => Extraction::Malformed,
         _ => Extraction::Malformed,
     }
 }

@@ -27,23 +27,16 @@ use praxis_policy_core::identity::mapping::ClaimMapConfig;
 /// Top-level plugin config — what operators write under
 /// `plugins[<name>].config:` in unified-config YAML.
 ///
-/// One instance of this plugin handles ONE inbound credential (one
-/// header, cookie, or query parameter; one role). Wire multiple
-/// instances if a deployment expects multiple inbound tokens — e.g.
-/// user JWT in `X-User-Token`, OAuth client token in `Authorization`,
-/// and a SPIFFE JWT-SVID in `X-Workload-Token`.
+/// Each instance resolves one credential and one role. Configure multiple
+/// instances when a request carries separate user, client, or workload tokens.
 ///
 /// Unknown keys are rejected. Every field here is optional or defaulted, so a
 /// misspelling would otherwise deserialize to the default and take effect
 /// silently: `claim_maps` would leave the resolver on the standard preset while
 /// the operator believed their map was live.
 ///
-/// The old `header: "Authorization"` field was removed with no deprecation
-/// period. A config still writing it fails the load with serde's generic
-/// "unknown field `header`" message (naming the accepted field set,
-/// `credential` included) rather than a hand-authored migration message —
-/// this shape is still settling, so a bespoke error string isn't worth the
-/// upkeep yet. Revisit once `credential:` is stable.
+/// The former `header` field is no longer accepted. Use `credential` to
+/// select a header, cookie, or query parameter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JwtIdentityResolverConfig {

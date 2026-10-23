@@ -85,9 +85,9 @@ fn resolver_plugin_config_for_query_param(name: &str) -> PluginConfig {
     cfg
 }
 
-// =====================================================================
-// Scenarios
-// =====================================================================
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 /// Happy path: valid signed token resolves to a populated subject,
 /// raw token lands in `raw_credentials.inbound_tokens[User]`.
@@ -116,13 +116,11 @@ async fn valid_jwt_resolves_subject() {
     assert_eq!(subject.id.as_deref(), Some("alice@corp.com"));
     assert!(subject.roles.contains("hr"));
     assert!(subject.roles.contains("reader"));
-    // `email` was not a reserved claim, lands under subject.claims
     assert_eq!(
         subject.claims.get("email"),
         Some(&serde_json::json!("alice@corp.com")),
     );
 
-    // Raw token stashed for forwarding plugins.
     let raw = identity
         .raw_credentials
         .as_ref()
@@ -135,13 +133,6 @@ async fn valid_jwt_resolves_subject() {
     assert!(matches!(user_token.kind, TokenKind::Jwt));
 }
 
-// ---------------------------------------------------------------------
-// Cookie and query-parameter credential locations
-// ---------------------------------------------------------------------
-
-/// Same happy path as [`valid_jwt_resolves_subject`], but the token arrives
-/// in a `Cookie` header instead of `Authorization`, through the real
-/// pipeline (config → `PolicyEngine` → resolver → merged `IdentityPayload`).
 #[tokio::test]
 async fn valid_jwt_from_cookie_resolves_subject() {
     let token = mint_jwt(json!({
@@ -170,8 +161,6 @@ async fn valid_jwt_from_cookie_resolves_subject() {
     assert_eq!(subject.id.as_deref(), Some("alice@corp.com"));
 }
 
-/// Same happy path, with the token arriving in the raw query string instead
-/// of a header or cookie — the WebSocket/SSE case that cannot set headers.
 #[tokio::test]
 async fn valid_jwt_from_query_param_resolves_subject() {
     let token = mint_jwt(json!({
@@ -203,9 +192,6 @@ async fn valid_jwt_from_query_param_resolves_subject() {
     assert_eq!(subject.id.as_deref(), Some("alice@corp.com"));
 }
 
-/// The stashed `RawInboundToken` records where the credential actually came
-/// from — a cookie, not the default `Authorization` header — so forwarding
-/// plugins and audit logging see the true origin.
 #[tokio::test]
 async fn raw_inbound_token_records_cookie_origin() {
     let token = mint_jwt(json!({
@@ -243,7 +229,6 @@ async fn raw_inbound_token_records_cookie_origin() {
     );
 }
 
-/// Same as above, for the query-parameter location.
 #[tokio::test]
 async fn raw_inbound_token_records_query_param_origin() {
     let token = mint_jwt(json!({
@@ -284,26 +269,9 @@ async fn raw_inbound_token_records_query_param_origin() {
     );
 }
 
-// ---------------------------------------------------------------------
-// Workload role — SPIFFE JWT-SVID ingress
-// ---------------------------------------------------------------------
-
-/// A resolver configured with `role: workload` is the ingress for the
-/// caller's SPIFFE JWT-SVID. It must land the mapped identity in
-/// `caller_workload` (the *calling agent*, distinct from the gateway's
-/// own `this_workload`) and stash the raw bytes under
-/// `TokenRole::CallerWorkload` — the slot a `delegate(...)` step reads from
-/// when a route says `subject: workload` or `actor: workload`.
-///
-/// The stash is tagged `TokenKind::SpiffeJwt`, not the generic `Jwt`:
-/// reaching this point means `map_workload` already accepted the
-/// SPIFFE-shaped `sub`, so the wire format is known, and consumers
-/// that branch on kind shouldn't have to re-parse the token to learn
-/// what the resolver already established.
 #[tokio::test]
 async fn workload_svid_resolves_caller_workload_and_stashes_as_spiffe_jwt() {
     let svid = mint_jwt(json!({
-        // SPIFFE JWT-SVID convention: the SPIFFE ID lives in `sub`.
         "sub": "spiffe://corp.example/ns/default/sa/payroll-agent",
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
@@ -326,7 +294,6 @@ async fn workload_svid_resolves_caller_workload_and_stashes_as_spiffe_jwt() {
     let identity =
         IdentityPayload::from_pipeline_result(&result).expect("payload should be present");
 
-    // Lands in caller_workload — the inbound peer — not subject.
     let workload = identity
         .caller_workload
         .as_ref()
@@ -341,8 +308,6 @@ async fn workload_svid_resolves_caller_workload_and_stashes_as_spiffe_jwt() {
         "a workload-role resolver must not populate the user slot",
     );
 
-    // Stashed under the Workload role, tagged as a SPIFFE JWT-SVID,
-    // and attributed to the header it arrived on.
     let raw = identity
         .raw_credentials
         .as_ref()
@@ -517,21 +482,12 @@ async fn tampered_signature_rejects() {
         "aud": TEST_AUDIENCE,
         "exp": now_unix() + 300,
     }));
-    // Flip a char in the middle of the signature segment. We
-    // can't tamper with the *last* char because base64url
-    // encoding of a 256-byte RSA-2048 signature requires its last
-    // char to encode 4 trailing-bit zeros — only `{A, Q, g, w}`
-    // satisfy that. A naive flip to an out-of-set char produces
-    // invalid base64 (decoder error → `auth.malformed_credential`)
-    // rather than valid bytes that fail signature verification.
-    // Middle-segment chars don't have the trailing-bit constraint.
     let parts: Vec<&str> = valid.split('.').collect();
     assert_eq!(parts.len(), 3, "JWT should have three segments");
     let sig = parts[2];
     let mut sig_chars: Vec<char> = sig.chars().collect();
     let target_idx = sig_chars.len() / 2; // well into the middle
     let original = sig_chars[target_idx];
-    // Pick a replacement that's different but in the same charset.
     let replacement = if original == 'A' { 'B' } else { 'A' };
     sig_chars[target_idx] = replacement;
     let new_sig: String = sig_chars.into_iter().collect();
@@ -543,13 +499,10 @@ async fn tampered_signature_rejects() {
     assert_eq!(v.code, "auth.signature_invalid");
 }
 
-/// Token with no `iss` claim at all → `auth.malformed_credential` from
-/// the peek step (we can't pick a trusted issuer without `iss`).
 #[tokio::test]
 async fn missing_iss_rejects() {
     let token = mint_jwt(json!({
         "sub": "alice",
-        // no iss
         "aud": TEST_AUDIENCE,
         "exp": now_unix() + 300,
     }));
@@ -560,14 +513,6 @@ async fn missing_iss_rejects() {
     assert_eq!(v.code, "auth.malformed_credential");
 }
 
-// =====================================================================
-// Header origin tracking
-// =====================================================================
-
-/// The default `Authorization` header path must record the credential
-/// origin as `Credential::Header { name: "Authorization" }` on the
-/// stashed raw token — the same provenance cookie and query-param
-/// paths already assert.
 #[tokio::test]
 async fn raw_inbound_token_records_header_origin() {
     let token = mint_jwt(json!({
@@ -600,14 +545,6 @@ async fn raw_inbound_token_records_header_origin() {
     );
 }
 
-// =====================================================================
-// Named header via the headers map (primary path, not raw_token fallback)
-// =====================================================================
-
-/// When a resolver is configured with a custom header name, the token
-/// must be found in `payload.headers()["x-user-token"]` — the primary
-/// extraction path. This exercises the header-map lookup directly rather
-/// than the `raw_token()` fallback that `invoke()` would hit.
 #[tokio::test]
 async fn custom_header_extracts_from_headers_map() {
     let token = mint_jwt(json!({
@@ -654,13 +591,6 @@ async fn custom_header_extracts_from_headers_map() {
     );
 }
 
-// =====================================================================
-// Cross-location mismatch
-// =====================================================================
-
-/// Config says `credential: cookie`, but the request has no `Cookie`
-/// header at all — the token is only in `Authorization`. The resolver
-/// must reject with `auth.missing_credential`, not fall through.
 #[tokio::test]
 async fn cookie_config_rejects_when_no_cookie_header_present() {
     let token = mint_jwt(json!({
@@ -671,7 +601,6 @@ async fn cookie_config_rejects_when_no_cookie_header_present() {
         "iat": now_unix(),
     }));
 
-    // Token in Authorization header only — no Cookie header.
     let mut headers = HashMap::new();
     headers.insert("authorization".to_owned(), format!("Bearer {token}"));
     let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
@@ -686,8 +615,6 @@ async fn cookie_config_rejects_when_no_cookie_header_present() {
     assert_eq!(v.code, "auth.missing_credential");
 }
 
-/// Config says `credential: query_param`, but the host supplied no
-/// query string. The resolver must reject with `auth.missing_credential`.
 #[tokio::test]
 async fn query_param_config_rejects_when_no_query_string_present() {
     let token = mint_jwt(json!({
@@ -698,7 +625,6 @@ async fn query_param_config_rejects_when_no_query_string_present() {
         "iat": now_unix(),
     }));
 
-    // Token only in Authorization — no query string set.
     let mut headers = HashMap::new();
     headers.insert("authorization".to_owned(), format!("Bearer {token}"));
     let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
@@ -716,13 +642,6 @@ async fn query_param_config_rejects_when_no_query_string_present() {
     assert_eq!(v.code, "auth.missing_credential");
 }
 
-// =====================================================================
-// Empty credential values
-// =====================================================================
-
-/// A cookie with an empty value (`__Host-jwt=`) is present-but-empty.
-/// The resolver must reject with `auth.empty_credential`, which is
-/// distinct from `auth.missing_credential` (name not found at all).
 #[tokio::test]
 async fn empty_cookie_value_rejects_with_empty_credential() {
     let mut headers = HashMap::new();
@@ -736,8 +655,6 @@ async fn empty_cookie_value_rejects_with_empty_credential() {
     assert_eq!(v.code, "auth.empty_credential");
 }
 
-/// A query parameter with an empty value (`access_token=`) is
-/// present-but-empty → `auth.empty_credential`.
 #[tokio::test]
 async fn empty_query_param_value_rejects_with_empty_credential() {
     let payload = IdentityPayload::new("", TokenSource::Bearer);
@@ -754,13 +671,6 @@ async fn empty_query_param_value_rejects_with_empty_credential() {
     assert_eq!(v.code, "auth.empty_credential");
 }
 
-// =====================================================================
-// Cookie / query-param parse failures through the full pipeline
-// =====================================================================
-
-/// A `Cookie` header with a duplicate name → `auth.ambiguous_credential`.
-/// The unit tests in `http_credential.rs` cover the parser; this checks
-/// the error-code mapping in `extract_token()` end-to-end.
 #[tokio::test]
 async fn duplicate_cookie_name_rejects_with_ambiguous_credential() {
     let mut headers = HashMap::new();
@@ -777,8 +687,6 @@ async fn duplicate_cookie_name_rejects_with_ambiguous_credential() {
     assert_eq!(v.code, "auth.ambiguous_credential");
 }
 
-/// A query string with a duplicate parameter name →
-/// `auth.ambiguous_credential`.
 #[tokio::test]
 async fn duplicate_query_param_name_rejects_with_ambiguous_credential() {
     let payload = IdentityPayload::new("", TokenSource::Bearer);
@@ -795,8 +703,6 @@ async fn duplicate_query_param_name_rejects_with_ambiguous_credential() {
     assert_eq!(v.code, "auth.ambiguous_credential");
 }
 
-/// A `Cookie` header containing a control character (header-smuggling
-/// defense) → `auth.malformed_credential`.
 #[tokio::test]
 async fn cookie_with_control_char_rejects_with_malformed_credential() {
     let mut headers = HashMap::new();
@@ -813,8 +719,6 @@ async fn cookie_with_control_char_rejects_with_malformed_credential() {
     assert_eq!(v.code, "auth.malformed_credential");
 }
 
-/// A query string containing a control character →
-/// `auth.malformed_credential`.
 #[tokio::test]
 async fn query_string_with_control_char_rejects_with_malformed_credential() {
     let payload = IdentityPayload::new("", TokenSource::Bearer);
@@ -831,9 +735,6 @@ async fn query_string_with_control_char_rejects_with_malformed_credential() {
     assert_eq!(v.code, "auth.malformed_credential");
 }
 
-/// Named cookie not found among the parsed cookies →
-/// `auth.missing_credential` (different from no `Cookie` header at all,
-/// which is the same code but a different reason string).
 #[tokio::test]
 async fn cookie_name_not_found_rejects_with_missing_credential() {
     let mut headers = HashMap::new();
@@ -847,8 +748,6 @@ async fn cookie_name_not_found_rejects_with_missing_credential() {
     assert_eq!(v.code, "auth.missing_credential");
 }
 
-/// Named query parameter not found in the parsed query string →
-/// `auth.missing_credential`.
 #[tokio::test]
 async fn query_param_name_not_found_rejects_with_missing_credential() {
     let payload = IdentityPayload::new("", TokenSource::Bearer);
@@ -865,13 +764,6 @@ async fn query_param_name_not_found_rejects_with_missing_credential() {
     assert_eq!(v.code, "auth.missing_credential");
 }
 
-// =====================================================================
-// Multi-value cookie / query-string selection
-// =====================================================================
-
-/// A real browser sends many cookies in one header. The resolver must
-/// pick the configured name out of a multi-cookie header and ignore
-/// the rest.
 #[tokio::test]
 async fn cookie_selected_from_multi_cookie_header() {
     let token = mint_jwt(json!({
@@ -903,8 +795,6 @@ async fn cookie_selected_from_multi_cookie_header() {
     assert_eq!(subject.id.as_deref(), Some("alice@corp.com"));
 }
 
-/// A query string with multiple parameters. The resolver must pick the
-/// configured name and ignore the rest.
 #[tokio::test]
 async fn query_param_selected_from_multi_param_query_string() {
     let token = mint_jwt(json!({
@@ -936,13 +826,6 @@ async fn query_param_selected_from_multi_param_query_string() {
     assert_eq!(subject.id.as_deref(), Some("alice@corp.com"));
 }
 
-// =====================================================================
-// Client role — OAuth client-credential ingress
-// =====================================================================
-
-/// A resolver configured with `role: client` must land the mapped
-/// identity in `client` (the OAuth client/application slot) and stash
-/// the raw bytes under `TokenRole::Client`.
 #[tokio::test]
 async fn client_role_resolves_client_and_stashes_token() {
     let token = mint_jwt(json!({
@@ -1003,14 +886,10 @@ async fn client_role_resolves_client_and_stashes_token() {
     );
 }
 
-/// A `role: client` resolver handed a token with no `client_id` (and
-/// no `azp`) must reject — guards the boundary so whatever is in the
-/// client slot really has a client identity.
 #[tokio::test]
 async fn client_role_rejects_token_without_client_id() {
     let token = mint_jwt(json!({
         "sub": "alice@corp.com",
-        // no client_id, no azp
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
         "exp": now_unix() + 300,

@@ -109,16 +109,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-/// Where a raw credential was extracted from on the wire. Shared by
-/// every identity plugin — the JWT resolver, a future X.509/mTLS
-/// resolver, a future WIMSE Proof Token resolver — so downstream
-/// consumers (audit logging, assertion propagation, policy
-/// predicates) see one uniform origin type regardless of which
-/// plugin produced it.
-///
-/// `#[non_exhaustive]`: future locations (e.g. a form-encoded body
-/// field) can be added without breaking exhaustive `match`es in
-/// downstream crates.
+/// The request location from which an identity plugin read a credential.
+/// Consumers can use it to preserve or report the credential's origin.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -280,9 +272,7 @@ pub enum DelegationMode {
 /// a serialize-then-reparse silently yields an empty token. See the
 /// module docs for the conditions under which that is permitted.
 ///
-/// `Debug` is hand-written rather than derived — see the impl below
-/// — so that `tracing::debug!(?raw_token)` and similar diagnostics
-/// never print the token value.
+/// `Debug` output redacts the token value.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RawInboundToken {
     /// The raw credential bytes. Cleared on drop via `Zeroizing`.

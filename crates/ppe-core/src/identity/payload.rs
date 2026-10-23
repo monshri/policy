@@ -105,10 +105,7 @@ pub enum TokenSource {
 /// Implements `PluginPayload` so it can flow through the executor's
 /// existing Sequential-phase machinery — no bespoke plumbing.
 ///
-/// `Debug` is hand-written rather than derived — see the impl below — so
-/// that `tracing::debug!(?payload)` and similar diagnostics never print
-/// `raw_token` or header values, either of which can carry a live
-/// bearer token in plaintext.
+/// `Debug` output redacts the raw token and all header values.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct IdentityPayload {
     /// Raw credential bytes. Cleared on drop via `Zeroizing`.

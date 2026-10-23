@@ -261,6 +261,24 @@ impl JwtIdentityResolver {
             }));
         }
 
+        if let Some(issuer) = typed
+            .trusted_issuers
+            .iter()
+            .find(|i| i.dpop.mode != DpopMode::Off)
+            && matches!(
+                typed.credential.as_ref(),
+                Some(Credential::Cookie { .. } | Credential::QueryParam { .. })
+            )
+        {
+            return Err(Box::new(PluginError::Config {
+                message: format!(
+                    "plugin '{}' ({KIND}): trusted_issuer '{}' enables DPoP, which requires \
+                     a header credential; use a header credential or disable DPoP",
+                    cfg.name, issuer.issuer
+                ),
+            }));
+        }
+
         // Partition issuer configs:
         //   * Inline / on-disk decoding keys (Pem, PemFile, Jwk,
         //     Secret) → eagerly built into TrustedIssuers here.
@@ -769,15 +787,8 @@ impl JwtIdentityResolver {
 }
 
 impl JwtIdentityResolver {
-    /// Extract the raw token from wherever `self.location` says it lives.
-    ///
-    /// For headers, keeps JWT-specific Bearer stripping as
-    /// post-extraction normalization (bare tokens pass through) and the
-    /// `raw_token()` back-compat fallback. Ambiguity detection is now
-    /// handled by `CredentialLocation::raw()`.
-    ///
-    /// For cookies and query parameters, delegates entirely to
-    /// `CredentialLocation::raw()`.
+    /// Read the configured credential and report a location-specific denial
+    /// when it cannot be used.
     fn extract_token(
         &self,
         payload: &IdentityPayload,
@@ -1479,14 +1490,6 @@ mod tests {
         }
     }
 
-    /// An issuer whose accepted-algorithm list has been emptied after a valid
-    /// build must reject every token rather than abort, and rejecting is the
-    /// only safe answer: an empty list read as "any algorithm is acceptable"
-    /// hands algorithm choice to whoever minted the token.
-    ///
-    /// `TrustedIssuerConfig::validate` blocks this at configuration time, so
-    /// the state is only reachable through the public `algorithms` field. The
-    /// test constructs it directly for that reason.
     #[test]
     fn empty_algorithm_list_rejects_the_token() {
         let issuer = TrustedIssuer {
@@ -1941,7 +1944,6 @@ mod tests {
         let issuers = resolver.trusted_issuers.read().unwrap();
         assert_eq!(issuers.len(), 1);
         assert_eq!(issuers[0].issuer, "https://idp.example.com");
-        // Secret source resolves eagerly — no pending JWKS work.
         assert!(resolver.pending_jwks.is_empty());
     }
 
@@ -2026,15 +2028,6 @@ mod tests {
         );
     }
 
-    // ---- where the token comes from ---------------------------------------
-    //
-    // Every existing test hands the resolver a populated `raw_token`, so the
-    // header-resolution branch was never exercised. It is what decides whether
-    // this resolver finds its credential at all, and each failure has to deny
-    // rather than fall through: a resolver that returned Allow on a missing
-    // header would leave the identity slot empty and any downstream
-    // `require(authenticated)` reading as satisfied-by-absence.
-
     use praxis_policy_core::identity::TokenSource;
     use std::collections::HashMap;
 
@@ -2092,8 +2085,6 @@ mod tests {
     #[tokio::test]
     async fn a_missing_header_and_no_fallback_token_denies() {
         let resolver = resolver_on_header("X-User-Token");
-        // Headers populated but not with ours, and no pre-extracted token, so
-        // neither source yields a credential.
         let payload = IdentityPayload::new("", TokenSource::Bearer)
             .with_headers(HashMap::from([("other".to_owned(), "v".to_owned())]));
         assert_eq!(
@@ -2127,8 +2118,6 @@ mod tests {
                 "x-user-token".to_owned(),
                 jwt_with_payload(r#"{"iss":"https://nobody.example","sub":"alice"}"#),
             )]));
-        // The token is found (so not missing_credential) and rejected later for
-        // its issuer, which is what proves the lookup matched.
         assert_eq!(
             deny_code_for(&resolver, payload).await,
             "auth.untrusted_issuer",
@@ -2183,8 +2172,6 @@ mod tests {
             "with a populated header map the fallback must not fire"
         );
     }
-
-    // ---- credential-name whitespace validation ------------------------------
 
     #[test]
     fn credential_header_name_with_leading_whitespace_rejected() {
@@ -2274,8 +2261,6 @@ mod tests {
         );
     }
 
-    // ---- case-insensitive header lookup ------------------------------------
-
     #[tokio::test]
     async fn header_lookup_is_case_insensitive() {
         let resolver = resolver_on_header("Authorization");
@@ -2344,8 +2329,6 @@ mod tests {
             "duplicate Cookie headers with different casing must be rejected"
         );
     }
-
-    // ---- cookie and query-param credential locations ----------------------
 
     /// A resolver configured to read its token from a cookie of the given name.
     fn resolver_on_cookie(name: &str) -> JwtIdentityResolver {
@@ -2447,11 +2430,6 @@ mod tests {
         );
     }
 
-    /// A `Cookie` header over the 8 KiB parser limit denies as malformed
-    /// rather than the resolver hanging on to an oversized allocation. This
-    /// exercises `extract_token`'s `other =>` fallback arm for a
-    /// `CredentialParseError` that isn't `Duplicate` — the duplicate-name
-    /// tests above only cover that one variant.
     #[tokio::test]
     async fn an_oversized_cookie_header_denies_as_malformed() {
         let resolver = resolver_on_cookie("__Host-jwt");
@@ -2465,9 +2443,6 @@ mod tests {
         );
     }
 
-    /// A `Cookie` header containing a raw control character denies as
-    /// malformed — the header-smuggling guard in `http_credential`, reached
-    /// through the resolver rather than tested against the parser directly.
     #[tokio::test]
     async fn a_cookie_header_with_a_control_character_denies_as_malformed() {
         let resolver = resolver_on_cookie("__Host-jwt");
@@ -2541,9 +2516,6 @@ mod tests {
         );
     }
 
-    /// A raw query string over the 8 KiB parser limit denies as malformed —
-    /// the query-param counterpart to the oversized-cookie test above,
-    /// exercising `extract_token`'s query-param `other =>` fallback arm.
     #[tokio::test]
     async fn an_oversized_query_string_denies_as_malformed() {
         let resolver = resolver_on_query_param("access_token");
@@ -2580,17 +2552,10 @@ mod tests {
         );
     }
 
-    /// Denial reasons must name the credential location and configured name
-    /// but never the value — the "without logging the credential" requirement.
-    ///
-    /// Uses a real JWT with an untrusted issuer so the token reaches the
-    /// issuer-matching path where the raw value was genuinely in hand.
-    /// Covers both cookie and `query_param` credential locations.
     #[tokio::test]
     async fn denial_reasons_never_contain_the_credential_value() {
         let token = jwt_with_payload(r#"{"iss":"https://untrusted.example","sub":"alice"}"#);
 
-        // Cookie path
         let resolver = resolver_on_cookie("__Host-jwt");
         let mut headers = HashMap::new();
         headers.insert("cookie".to_owned(), format!("__Host-jwt={token}"));
@@ -2607,7 +2572,6 @@ mod tests {
             "cookie: token leaked into reason: {reason}"
         );
 
-        // Query-param path
         let resolver = resolver_on_query_param("access_token");
         let payload = IdentityPayload::new("", TokenSource::Bearer);
         let qp_ext = ext_with_query(format!("access_token={token}"));
@@ -2624,10 +2588,6 @@ mod tests {
         );
     }
 
-    /// A token with no `iss` cannot be matched to a trusted issuer, so it is
-    /// refused rather than checked against an arbitrary one.
-    ///
-    /// A token with no `iss` claim cannot be matched to a trusted issuer.
     #[tokio::test]
     async fn a_token_with_no_issuer_claim_denies() {
         let resolver = resolver_on_header("authorization");
@@ -2639,7 +2599,6 @@ mod tests {
         );
     }
 
-    /// Garbage that is not a JWT at all takes the same branch.
     #[tokio::test]
     async fn a_token_that_is_not_a_jwt_denies() {
         let resolver = resolver_on_header("authorization");
@@ -2650,17 +2609,6 @@ mod tests {
         );
     }
 
-    // ---- configuration the resolver has to refuse -------------------------
-
-    /// Config mistakes an operator can actually make, each of which has to be
-    /// refused at load rather than at the first request.
-    ///
-    /// The stakes differ per case but point the same way. A resolver that
-    /// constructs with no usable key would deny every request in production
-    /// with a message about the token instead of about the config, and one that
-    /// constructs with a blank `credential.name` would look for a header no
-    /// client can send. Failing at load turns both into a gateway that refuses
-    /// to start.
     #[test]
     fn each_malformed_config_is_refused_at_load_with_a_message_naming_the_fault() {
         let cases: [(&str, Value, &str); 11] = [
@@ -2823,8 +2771,6 @@ mod tests {
             .expect("an untagged variant accepts any string");
         assert_eq!(role, TokenRole::Custom("auditor".to_owned()));
     }
-
-    // ---- verify-time denials, against real signatures ---------------------
 
     /// Sign a claim set the way the trusted issuer in these tests expects.
     /// Tokens elsewhere in this file carry a fake signature, which is enough to
@@ -3062,14 +3008,6 @@ mod tests {
         }
     }
 
-    /// A token whose `nbf` is barely in the future is still accepted, because
-    /// the issuer's clock is not ours and the leeway exists for exactly that.
-    ///
-    /// This is the other half of the `nbf` case above, and the reason it is
-    /// worth its own test: the obvious response to a skew complaint from
-    /// production is to stop validating `nbf` at all, which would silently
-    /// restore accepting a token its issuer says is not yet valid. Widening the
-    /// leeway is the fix; this test fails if the check is removed instead.
     #[tokio::test]
     async fn a_token_whose_nbf_is_within_the_leeway_is_accepted() {
         let resolver = resolver_for_role("user");
@@ -3109,7 +3047,6 @@ mod tests {
     /// a request that has none.
     #[tokio::test]
     async fn a_verified_token_missing_the_claims_its_role_needs_denies() {
-        // `sub` is what the user role maps; an empty override drops it.
         let mut without_sub = valid_claims(json!({}));
         without_sub
             .as_object_mut()
@@ -3245,8 +3182,6 @@ mod tests {
             variant_of(&err)
         );
 
-        // The control: the kid that is in the store verifies, so the failure
-        // above is attributable to the kid and not to the fixture.
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
         header.kid = Some("key-1".to_owned());
         let good = jsonwebtoken::encode(

@@ -195,6 +195,11 @@ plugins:
 Omitting `credential:` defaults to
 `{ kind: header, name: Authorization }`.
 
+An issuer with DPoP enabled requires a header credential and the
+`read_headers` capability. A cookie or query parameter credential fails
+configuration loading when that issuer's DPoP mode is `optional` or
+`required`.
+
 Cookie and query-string values are parsed by PPE itself, not by the
 host's HTTP framework, so the same request resolves the same credential
 regardless of which proxy sits in front of it. Duplicate cookie names or

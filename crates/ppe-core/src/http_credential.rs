@@ -29,15 +29,12 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 
-/// Maximum size, in bytes, of a raw `Cookie` header value or raw query
-/// string this module will parse. RFC 6265 §6.1 recommends servers
-/// support at least 4096 bytes per cookie, and a single `Cookie`
-/// header commonly carries many unrelated cookies (analytics, A/B,
-/// session), so the total can exceed 8 KiB even when the credential
-/// cookie itself is small. 16 KiB accommodates realistic headers
-/// while still bounding the `HashMap` a hostile request could force
-/// us to allocate.
-const MAX_INPUT_LEN: usize = 16 * 1024;
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+// A Cookie header can carry several cookies; cap the whole input to bound parsing.
+const MAX_INPUT_LEN: usize = 16_384; // 16 KiB
 
 /// Reason a raw credential string was rejected during parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -146,9 +143,9 @@ fn insert_unique(
     Ok(())
 }
 
-/// Parse a raw `Cookie` header value (RFC 6265 §4.2.1) into name-value
-/// pairs. Rejects oversized input, control characters, and duplicate
-/// occurrences of `credential_name`.
+/// Parse a raw `Cookie` header value into name-value pairs per
+/// [RFC 6265 Section 4.2.1]. Rejects oversized input, control characters,
+/// and duplicate occurrences of `credential_name`.
 ///
 /// Splits on `; ` (with tolerance for a bare `;`), trims whitespace
 /// from names but not values (RFC 6265 does not define value
@@ -162,6 +159,8 @@ fn insert_unique(
 /// an ASCII control character (except HTAB), and
 /// [`CredentialParseError::Duplicate`] when `credential_name` appears
 /// twice.
+///
+/// [RFC 6265 Section 4.2.1]: https://datatracker.ietf.org/doc/html/rfc6265#section-4.2.1
 pub fn parse_cookie_header(
     raw: &str,
     credential_name: &str,
@@ -289,7 +288,6 @@ mod tests {
 
     #[test]
     fn cookie_whitespace_tolerance() {
-        // No leading space (";" tolerance, no trailing space) still works.
         let m = parse_cookie_header("a=1;b=2", "_").unwrap();
         assert_eq!(m.get("a").map(String::as_str), Some("1"));
         assert_eq!(m.get("b").map(String::as_str), Some("2"));

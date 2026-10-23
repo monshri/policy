@@ -65,7 +65,6 @@ async fn a_value_that_is_only_the_scheme_is_empty_not_unknown() {
 /// credential would come back unknown.
 #[tokio::test]
 async fn the_leader_after_the_scheme_stays_part_of_the_credential() {
-    // The record's digest is of `sk-oai-secret`, leader included.
     let file = one_record();
     let resolver =
         resolver(file_config(file.path(), Some("Bearer sk-oai-"))).expect("the config builds");
@@ -122,7 +121,6 @@ async fn the_auth_scheme_in_a_prefix_matches_without_case() {
         "bearer sk-oai-secret",
         "BEARER sk-oai-secret",
         "BeArEr sk-oai-secret",
-        // `1*SP`: any run of spaces separates the scheme from the credential.
         "bearer   sk-oai-secret",
     ] {
         let result = resolve_with_header(&resolver, value).await;
@@ -263,8 +261,6 @@ fn a_prefix_inside_credential_is_refused_at_config_load() {
     assert!(error.contains("unknown field"), "got: {error}");
 }
 
-// ---- cookie credential extraction -----------------------------------------
-
 #[tokio::test]
 async fn a_cookie_credential_resolves_an_identity() {
     let file = one_record();
@@ -332,8 +328,6 @@ async fn a_duplicate_cookie_name_denies_as_ambiguous() {
         "a duplicate credential cookie name must not resolve"
     );
 }
-
-// ---- query-param credential extraction ------------------------------------
 
 #[tokio::test]
 async fn a_query_param_credential_resolves_an_identity() {
