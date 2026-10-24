@@ -106,8 +106,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   Omitting both settings defaults to the `Authorization` header.
 
   Runtime deny codes for credential extraction: `auth.missing_credential`
-  (no value at the configured location), `auth.empty_credential` (name found
-  but value empty), `auth.ambiguous_credential` (duplicate configured name
+  (no value at the configured location), `auth.empty_credential` (no token
+  in the named value), `auth.ambiguous_credential` (duplicate configured name
   or differently cased header keys), and `auth.malformed_credential` (parse
   failure). Malformed JWTs use
   `auth.malformed_credential` at every credential location.

@@ -849,6 +849,12 @@ impl JwtIdentityResolver {
 
         if matches!(self.location.credential, Credential::Header { .. }) {
             let (scheme, token) = split_auth_scheme(&raw);
+            if token.is_empty() {
+                return Err(Box::new(PluginViolation::new(
+                    "auth.empty_credential",
+                    format!("{} is present but empty", self.location.credential),
+                )));
+            }
             Ok((scheme, token.to_owned()))
         } else {
             Ok((AuthScheme::Unspecified, raw))
@@ -2122,6 +2128,27 @@ mod tests {
         let resolver = resolver_on_header("x-user-token");
         let payload = IdentityPayload::new("", TokenSource::Bearer)
             .with_headers(HashMap::from([("x-user-token".to_owned(), String::new())]));
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.empty_credential"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // RFC 6750 Section 2.1
+    // -----------------------------------------------------------------------------
+
+    /// A [RFC 6750 Section 2.1] Bearer scheme without a token is empty.
+    ///
+    /// [RFC 6750 Section 2.1]: https://datatracker.ietf.org/doc/html/rfc6750#section-2.1
+    #[tokio::test]
+    async fn rfc6750_section_2_1_scheme_only_bearer_header_denies_as_empty() {
+        let resolver = resolver_on_header("authorization");
+        let payload =
+            IdentityPayload::new("", TokenSource::Bearer).with_headers(HashMap::from([(
+                "authorization".to_owned(),
+                "Bearer ".to_owned(),
+            )]));
         assert_eq!(
             deny_code_for(&resolver, payload).await,
             "auth.empty_credential"
