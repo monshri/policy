@@ -79,8 +79,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   the same credential regardless of which proxy sits in front of it. DPoP
   requires a header credential; cookie and query parameter locations are
   refused at load when an issuer enables DPoP.
-  The legacy `header:` setting remains supported. New configurations should
-  use `credential:`; the two settings cannot be combined:
+  The legacy `header:` setting remains supported but logs a deprecation
+  warning when the resolver is built. New configurations should use
+  `credential:`; the two settings cannot be combined:
 
   ```yaml
   # Legacy (still supported)

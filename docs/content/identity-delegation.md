@@ -705,7 +705,9 @@ plugins:
     capabilities: [perform_http]
     config:
       role: caller_workload
-      header: X-Workload-Token
+      credential:
+        kind: header
+        name: X-Workload-Token
       trusted_issuers:
         - issuer: "https://spire-oidc.internal:8443"
           audiences: ["vault"]
@@ -920,7 +922,9 @@ plugins:
     capabilities: [perform_http, read_headers]   # read_headers: the proof names the request line
     config:
       role: client
-      header: Authorization
+      credential:
+        kind: header
+        name: Authorization
       trusted_issuers:
         - issuer: "https://idp.example.com/realms/corp"
           audiences: ["ppe"]
@@ -934,7 +938,9 @@ plugins:
     capabilities: [perform_http]
     config:
       role: user
-      header: X-User-Token
+      credential:
+        kind: header
+        name: X-User-Token
       trusted_issuers:
         - issuer: "https://idp.example.com/realms/corp"   # same IdP, its own settings: no dpop
           audiences: ["ppe"]

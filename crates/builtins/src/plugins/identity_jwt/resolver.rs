@@ -410,6 +410,7 @@ impl JwtIdentityResolver {
         let claim_mapper: Arc<dyn ClaimMapper> =
             Arc::new(ConfiguredClaimMap::new(compiled, JWT_MAPPING_PROFILE));
 
+        let uses_legacy_header = typed.header.is_some();
         let credential = typed
             .credential
             .or_else(|| typed.header.map(|name| Credential::Header { name }))
@@ -431,6 +432,14 @@ impl JwtIdentityResolver {
                 ),
             })
         })?;
+
+        if uses_legacy_header && let Credential::Header { name } = &credential {
+            tracing::warn!(
+                plugin = %cfg.name,
+                "deprecated `header:` setting; use \
+                 `credential: {{ kind: header, name: {name} }}` instead"
+            );
+        }
 
         // Query parameters routinely appear in HTTP access logs, CDN logs,
         // and browser history. PPE itself never logs the token value (see

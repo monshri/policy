@@ -197,7 +197,8 @@ plugins:
 
 Omitting both `credential:` and `header:` defaults to
 `{ kind: header, name: Authorization }`.
-The legacy `header: NAME` setting still works; migrate it to
+The legacy `header: NAME` setting still works but logs a deprecation
+warning when the resolver is built. Migrate it to
 `credential: { kind: header, name: NAME }` when updating the policy.
 Setting both fields on one resolver is a configuration error.
 

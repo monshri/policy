@@ -164,7 +164,8 @@ Omitting both `credential:` and `header:` defaults to
 > logging pipeline.
 
 > **Migration from `header:`.** Existing `header: "Authorization"`
-> settings remain supported. For new configurations, use
+> settings remain supported but log a deprecation warning when the
+> resolver is built. For new configurations, use
 > `credential: { kind: header, name: Authorization }`. Setting both
 > `header:` and `credential:` on one resolver fails at load. A config
 > that sets neither uses the `Authorization` header.

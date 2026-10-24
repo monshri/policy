@@ -68,8 +68,9 @@ pub struct JwtIdentityResolverConfig {
     #[serde(default)]
     pub credential: Option<Credential>,
 
-    /// Legacy header name. Use `credential: { kind: header, name: ... }`
-    /// for new configurations. Cannot be set alongside `credential`.
+    /// Deprecated header name. Construction logs a migration warning; use
+    /// `credential: { kind: header, name: ... }` for new configurations.
+    /// Cannot be set alongside `credential`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
 
