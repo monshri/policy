@@ -142,11 +142,6 @@ pub struct JwtIdentityResolver {
     /// which the raw token gets stashed in
     /// `RawCredentialsExtension.inbound_tokens`.
     role: TokenRole,
-    /// Where this resolver reads its token from — header, cookie, or
-    /// query parameter. Plugins that share a request extract from
-    /// different locations; the value lands on
-    /// `RawInboundToken.source` so forwarding plugins know where to
-    /// put it (or strip it) on the upstream call.
     location: CredentialLocation,
     /// Remembers accepted `DPoP` proof ids. Uses an in-memory guard by default;
     /// hosts can inject a shared guard for replay detection across instances.
@@ -418,11 +413,7 @@ impl JwtIdentityResolver {
                 name: "Authorization".to_owned(),
             });
 
-        // Build a CredentialLocation with no prefix — the JWT resolver
-        // handles Bearer stripping as a post-extraction normalization
-        // step rather than through the prefix gate, because
-        // strip_bearer_prefix is permissive (bare tokens pass through)
-        // while the prefix gate is strict (WrongPrefix on mismatch).
+        // The JWT resolver accepts bare tokens; the prefix gate would reject them.
         let location = CredentialLocation::new(credential.clone(), None);
         location.validate().map_err(|e| {
             Box::new(PluginError::Config {
@@ -441,12 +432,7 @@ impl JwtIdentityResolver {
             );
         }
 
-        // Query parameters routinely appear in HTTP access logs, CDN logs,
-        // and browser history. PPE itself never logs the token value (see
-        // `RawInboundToken`'s hand-written `Debug`), but infrastructure
-        // outside PPE's control may capture the raw URL — token and all.
-        // Flagging this at load time, once, gives the operator a chance to
-        // notice and scrub it from their own logging before it ships.
+        // Infrastructure may log raw URLs, so warn before serving requests.
         if matches!(credential, Credential::QueryParam { .. }) {
             tracing::warn!(
                 plugin = %cfg.name,

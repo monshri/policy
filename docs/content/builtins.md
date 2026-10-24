@@ -148,11 +148,12 @@ kinds are supported:
 
 | Kind | Use case | Example |
 |---|---|---|
-| `header` | The common case — a Bearer token on an HTTP header | `Authorization`, `X-User-Token` |
-| `cookie` | Browser apps that deliver the JWT in an HttpOnly cookie | `__Host-jwt`, `session` |
-| `query_param` | Endpoints where the client cannot set headers (WebSocket, SSE) | `access_token` |
+| `header` | Bearer token | `Authorization` |
+| `cookie` | Browser app | `__Host-jwt` |
+| `query_param` | WebSocket or SSE | `access_token` |
 
-Query parameter credentials require the `read_query` capability. Granting
+Query parameter credentials require the host to supply the raw query string
+in `HttpExtension.query` and grant the resolver `read_query`. Granting
 `read_headers` alone does not expose the raw query string to a plugin.
 
 ```yaml

@@ -1,29 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-// Parsing a raw `Cookie` header value and a raw URL query string into
-// name-value pairs, deterministically and independent of which HTTP
-// framework the host runs.
-//
-// # Why PPE parses instead of the host
-//
-// Cookie and query-string extraction must produce the same result no
-// matter which HTTP framework the host uses — Envoy sidecar, Node
-// gateway, Rust proxy. Different frameworks parse duplicate names,
-// whitespace, and encoding differently; if each host parsed its own
-// way, the same JWT could be extracted or rejected depending on which
-// host runs it. The host hands PPE the raw string and PPE applies one
-// parser to every request.
-//
-// # No percent-decoding
-//
-// JWTs are base64url and never contain characters that need
-// percent-encoding. PPE does not decode percent-encoded names or
-// values — a literal match is required. When a query parameter name
-// matches the configured credential name only after percent-decoding,
-// parsing rejects the input with a diagnostic pointing the operator
-// to the encoding issue. A future non-JWT plugin that needs full
-// decoded values can revisit this contract.
+// Parse raw Cookie and query strings here so hosts using different HTTP
+// frameworks agree on duplicates, whitespace, and encoded names.
 
 use std::collections::HashMap;
 
@@ -33,7 +12,6 @@ use thiserror::Error;
 // Constants
 // -----------------------------------------------------------------------------
 
-// A Cookie header can carry several cookies; cap the whole input to bound parsing.
 const MAX_INPUT_LEN: usize = 16_384; // 16 KiB
 
 /// Reason a raw credential string was rejected during parsing.
@@ -50,22 +28,15 @@ pub enum CredentialParseError {
         max: usize,
     },
 
-    /// The raw input contains a control character (`\r`, `\n`, or
-    /// `\0`) — a defense against header-smuggling attacks that inject
-    /// a fake header via `\r\n` in a value the host's own parser
-    /// failed to strip.
+    /// The raw input contains an ASCII control character other than HTAB.
     #[error("{location} input contains a control character")]
     ControlCharacter {
         /// Where the input came from (`"cookie"` or `"query_param"`).
         location: &'static str,
     },
 
-    /// The configured credential name appeared more than once. Ambiguous
-    /// credential input is rejected outright rather than resolved by
-    /// "first wins" or "last wins" — a deterministic-but-arbitrary
-    /// tiebreak would let an attacker who can inject a second same-named
-    /// cookie or query parameter silently override which value a resolver
-    /// reads. Non-credential duplicate names are tolerated (first-wins).
+    /// The configured credential name appeared more than once. Other
+    /// duplicate names keep their first value.
     #[error("duplicate {location} name '{name}'")]
     Duplicate {
         /// Where the duplicate was found (`"cookie"` or `"query_param"`).
@@ -75,7 +46,7 @@ pub enum CredentialParseError {
     },
 
     /// A query parameter name matches the credential name only after
-    /// percent-decoding — the host or client is over-encoding.
+    /// percent-decoding.
     #[error(
         "query parameter '{encoded}' matches credential name '{credential}' \
          only after percent-decoding; the request source must send the \
@@ -137,22 +108,28 @@ fn insert_unique(
     Ok(())
 }
 
-/// Parse a raw `Cookie` header value into name-value pairs per
-/// [RFC 6265 Section 4.2.1]. Rejects oversized input, control characters,
-/// and duplicate occurrences of `credential_name`.
+/// Parse a raw `Cookie` header into the name-value pairs described by
+/// [RFC 6265 Section 4.2.1].
 ///
-/// Splits on `; ` (with tolerance for a bare `;`), trims whitespace
-/// from names but not values (RFC 6265 does not define value
-/// trimming), and does not percent-decode. A pair with no `=` is
-/// tolerated as a name with an empty value.
+/// Names are trimmed; values and percent escapes remain literal. A name
+/// without `=` has an empty value. Duplicate occurrences of
+/// `credential_name` are rejected; other duplicates keep their first value.
 ///
 /// # Errors
 ///
-/// [`CredentialParseError::TooLong`] when `raw` exceeds the size
-/// limit, [`CredentialParseError::ControlCharacter`] when it contains
-/// an ASCII control character (except HTAB), and
-/// [`CredentialParseError::Duplicate`] when `credential_name` appears
-/// twice.
+/// Returns [`CredentialParseError::TooLong`] for input over 16 KiB,
+/// [`CredentialParseError::ControlCharacter`] for a control character,
+/// or [`CredentialParseError::Duplicate`] for a repeated credential name.
+///
+/// # Examples
+///
+/// ```
+/// use praxis_policy_core::http_credential::parse_cookie_header;
+///
+/// let cookies = parse_cookie_header("theme=dark; session=abc", "session")?;
+/// assert_eq!(cookies.get("session").map(String::as_str), Some("abc"));
+/// # Ok::<(), praxis_policy_core::http_credential::CredentialParseError>(())
+/// ```
 ///
 /// [RFC 6265 Section 4.2.1]: https://datatracker.ietf.org/doc/html/rfc6265#section-4.2.1
 pub fn parse_cookie_header(
@@ -182,21 +159,31 @@ pub fn parse_cookie_header(
     Ok(out)
 }
 
-/// Parse a raw query string (the part after `?`, without the `?`)
-/// into name-value pairs. Rejects oversized input, control
-/// characters, and duplicate occurrences of `credential_name`.
+/// Parse a raw query string (without the `?`) into name-value pairs.
 ///
-/// Splits on `&`, splits each segment on the first `=`, and does not
-/// percent-decode. A segment with no `=` is tolerated as a name with
-/// an empty value.
+/// Names and values remain literal; percent escapes are not decoded.
+/// A name without `=` has an empty value. Duplicate occurrences of
+/// `credential_name` are rejected; other duplicates keep their first value.
+/// An encoded name that would match `credential_name` is rejected when
+/// no literal match is present.
 ///
 /// # Errors
 ///
-/// [`CredentialParseError::TooLong`] when `raw` exceeds the size
-/// limit, [`CredentialParseError::ControlCharacter`] when it contains
-/// an ASCII control character (except HTAB), and
-/// [`CredentialParseError::Duplicate`] when `credential_name` appears
-/// twice.
+/// Returns [`CredentialParseError::TooLong`] for input over 16 KiB,
+/// [`CredentialParseError::ControlCharacter`] for a control character,
+/// [`CredentialParseError::Duplicate`] for a repeated credential name,
+/// or [`CredentialParseError::PercentEncodedName`] for an encoded match.
+///
+/// # Examples
+///
+/// ```
+/// use praxis_policy_core::http_credential::{
+///     CredentialParseError, parse_query_string,
+/// };
+///
+/// let err = parse_query_string("token=a&token=b", "token").unwrap_err();
+/// assert!(matches!(err, CredentialParseError::Duplicate { .. }));
+/// ```
 pub fn parse_query_string(
     raw: &str,
     credential_name: &str,

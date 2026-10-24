@@ -57,11 +57,8 @@ pub struct JwtIdentityResolverConfig {
     #[serde(default = "default_role")]
     pub role: TokenRole,
 
-    /// Where this resolver reads its token from — header, cookie, or
-    /// query parameter. The `Bearer ` prefix is stripped when read
-    /// from a header. Recorded on `RawInboundToken.source` so
-    /// forwarding plugins can re-attach (or strip) the credential at
-    /// the same location.
+    /// Where this resolver reads its token: a header, cookie, or query
+    /// parameter. Header values may use the `Bearer` scheme.
     ///
     /// `None` uses the legacy `header` field when present, or the
     /// `Authorization` header otherwise.
@@ -1158,18 +1155,6 @@ mod tests {
         assert_eq!(cfg.claim_mapper.as_deref(), Some("standard"));
     }
 
-    fn minimal_issuer() -> serde_json::Value {
-        json!({
-            "issuer": "https://idp.example.com",
-            "audiences": ["my-api"],
-            "algorithms": ["HS256"],
-            "decoding_key": {
-                "kind": "secret",
-                "secret": "test-secret",
-            },
-        })
-    }
-
     #[test]
     fn credential_block_alone_deserializes() {
         let raw = json!({
@@ -1186,14 +1171,13 @@ mod tests {
     }
 
     #[test]
-    fn credential_omitted_defaults_to_none_here_header_at_construction() {
-        // The config layer leaves `credential: None` — the resolver
-        // constructor (not this deserializer) is what applies the
-        // `Header { name: "Authorization" }` default. See
-        // `JwtIdentityResolver::new`.
+    fn credential_omitted_leaves_selection_to_resolver() {
         let raw = json!({ "trusted_issuers": [minimal_issuer()] });
         let cfg: JwtIdentityResolverConfig = serde_json::from_value(raw).unwrap();
-        assert_eq!(cfg.credential, None);
+        assert_eq!(
+            cfg.credential, None,
+            "deserialization leaves it unspecified"
+        );
     }
 
     #[test]
@@ -1466,18 +1450,6 @@ mod tests {
         assert!(e.contains("issuer"), "{e}");
     }
 
-    fn issuer_for_audience_checks(audiences: Vec<String>, skip: bool) -> TrustedIssuerConfig {
-        TrustedIssuerConfig {
-            issuer: "https://idp.example".into(),
-            audiences,
-            skip_audience_validation: skip,
-            algorithms: vec![Algorithm::HS256],
-            decoding_key: DecodingKeySource::Secret { secret: "s".into() },
-            leeway_seconds: 0,
-            dpop: DpopConfig::default(),
-        }
-    }
-
     /// Omitted and explicitly empty `audiences` are the same fault when skip
     /// is off: the issuer would accept a token minted for any app.
     #[test]
@@ -1503,5 +1475,33 @@ mod tests {
             .expect_err("skip plus a list must fail");
         assert!(err.contains("skip_audience_validation"), "{err}");
         assert!(err.contains("pick one"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    fn minimal_issuer() -> serde_json::Value {
+        json!({
+            "issuer": "https://idp.example.com",
+            "audiences": ["my-api"],
+            "algorithms": ["HS256"],
+            "decoding_key": {
+                "kind": "secret",
+                "secret": "test-secret",
+            },
+        })
+    }
+
+    fn issuer_for_audience_checks(audiences: Vec<String>, skip: bool) -> TrustedIssuerConfig {
+        TrustedIssuerConfig {
+            issuer: "https://idp.example".into(),
+            audiences,
+            skip_audience_validation: skip,
+            algorithms: vec![Algorithm::HS256],
+            decoding_key: DecodingKeySource::Secret { secret: "s".into() },
+            leeway_seconds: 0,
+            dpop: DpopConfig::default(),
+        }
     }
 }

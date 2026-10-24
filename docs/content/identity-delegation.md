@@ -31,11 +31,11 @@ Every request crosses two identity boundaries:
 
 ### Identity slots (inbound)
 
-| Slot | Who it is | Typical credential | Resolver |
+| Slot | Principal | Credential | JWT role |
 |---|---|---|---|
-| `subject` | the human on whose behalf the call is made | `X-User-Token` header, or `__Host-jwt` cookie | `identity/jwt` (`role: user`) |
-| `client` | the OAuth app / agent as a registered client | `Authorization` header | `identity/jwt` (`role: client`) |
-| `caller_workload` | the *calling workload's own* identity (e.g. a SPIFFE SVID) | `X-Workload-Token` header | `identity/jwt` (`role: caller_workload`) |
+| `subject` | Human user | `X-User-Token` | `user` |
+| `client` | Calling app | `Authorization` | `client` |
+| `caller_workload` | Calling service | `X-Workload-Token` | `caller_workload` |
 
 Each resolver reads from one wire location — header, cookie, or query
 parameter — named in the `credential:` block. See

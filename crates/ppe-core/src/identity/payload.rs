@@ -95,15 +95,10 @@ pub enum TokenSource {
     Custom(String),
 }
 
-/// State threaded through the `IdentityResolve` hook chain.
+/// Request inputs and resolved identities shared by identity resolvers.
 ///
-/// See the module-level docs for the input/output split. In short:
-/// **input fields are private** (set once via the constructor +
-/// builders, never mutated), **output fields are `pub`** (handlers
-/// populate them on clones and return the updated payload).
-///
-/// Implements `PluginPayload` so it can flow through the executor's
-/// existing Sequential-phase machinery — no bespoke plumbing.
+/// Hosts set private inputs through constructors and builders. Resolvers
+/// fill the public output fields.
 ///
 /// `Debug` output redacts the raw token and all header values.
 #[derive(Clone, Serialize, Deserialize)]

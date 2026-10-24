@@ -258,21 +258,13 @@ pub enum DelegationMode {
     AsThisWorkload,
 }
 
-/// One inbound credential, captured at the wire layer and stashed
-/// here by an identity-resolver plugin. Validation happens elsewhere
-/// — this struct just carries the bytes and a few hints.
+/// An inbound credential captured by an identity resolver.
 ///
-/// The `token` field is `#[serde(skip)]`. Serializing a struct of
-/// this type yields `{ "source": {...}, "kind": "..." }` — the
-/// secret material is left out. Deserializing produces a struct
-/// whose `token` is `Zeroizing::new(String::new())`.
+/// Serialization and `Debug` omit the token bytes. Deserialization yields
+/// an empty token, so an out-of-process handler that needs the plaintext
+/// must receive it through a separate channel.
 ///
-/// A host that needs the plaintext across a process boundary must
-/// read the in-memory field and carry it on a purpose-built channel;
-/// a serialize-then-reparse silently yields an empty token. See the
-/// module docs for the conditions under which that is permitted.
-///
-/// `Debug` output redacts the token value.
+/// `source` and `kind` remain available after serialization.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RawInboundToken {
     /// The raw credential bytes. Cleared on drop via `Zeroizing`.
@@ -280,9 +272,7 @@ pub struct RawInboundToken {
     #[serde(skip)]
     pub token: Zeroizing<String>,
 
-    /// Where the token was extracted from on the wire — header,
-    /// cookie, or query parameter. Forwarding plugins re-attach
-    /// under the same location; audit logs cite it.
+    /// The wire location, available for forwarding and audit records.
     pub source: Credential,
 
     /// Wire-format family of the token. Lets handlers route to the

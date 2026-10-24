@@ -129,11 +129,11 @@ agent ends up presented by another. Delegation depends on the distinction — se
 Each resolver reads its token from one wire location, named by
 `credential:` in the plugin config:
 
-| `credential.kind` | When to use | Example name |
-|--------------------|-------------|--------------|
-| `header` (default) | Standard Bearer token flow | `Authorization`, `X-User-Token` |
-| `cookie` | Browser apps delivering the JWT in an HttpOnly cookie | `__Host-jwt` |
-| `query_param` | Clients that cannot set headers (WebSocket, SSE handshake) | `access_token` |
+| Kind | Use | Example name |
+|---|---|---|
+| `header` (default) | Bearer token | `Authorization` |
+| `cookie` | Browser session | `__Host-jwt` |
+| `query_param` | WebSocket or SSE | `access_token` |
 
 ```yaml
 # A browser app whose JWT arrives in a cookie

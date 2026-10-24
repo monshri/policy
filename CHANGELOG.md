@@ -105,11 +105,11 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
   Omitting both settings defaults to the `Authorization` header.
 
-  Runtime deny codes for credential extraction: `auth.missing_credential` (no
-  `Cookie` header or query string supplied), `auth.empty_credential` (name
-  found but value empty), `auth.ambiguous_credential` (duplicate cookie or
-  query-parameter name), `auth.malformed_credential` (parse failure — oversized
-  input or control characters). Malformed JWTs use
+  Runtime deny codes for credential extraction: `auth.missing_credential`
+  (no value at the configured location), `auth.empty_credential` (name found
+  but value empty), `auth.ambiguous_credential` (duplicate configured name
+  or differently cased header keys), and `auth.malformed_credential` (parse
+  failure). Malformed JWTs use
   `auth.malformed_credential` at every credential location.
 
   **Security note**: a resolver configured for `credential: { kind: query_param
@@ -129,11 +129,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   `Credential` object, not a plain string, so persisted or wire JSON using the
   old shape must be migrated. `Credential` (in
   `praxis_policy_core::extensions`) is the new shared type recording where any
-  identity plugin — this one, or a future X.509/mTLS or WIMSE Proof Token
-  resolver — extracted a credential from, so downstream consumers (audit
-  logging, assertion propagation, policy predicates) read one uniform type
-  regardless of which plugin produced it. `RawInboundToken`'s `Debug`
-  continues to redact the token.
+  identity plugin extracted a credential from, so downstream consumers can
+  read a uniform location type. `RawInboundToken`'s `Debug` continues to
+  redact the token.
 
   `IdentityPayload.headers` is now `#[serde(skip)]` — the field is no longer
   included in serialized output. Previously it was `skip_serializing_if =
@@ -181,8 +179,6 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   `Capability` adds `ReadMetadata` and `SlotName` adds `Metadata`, so
   exhaustive matches need a new arm. `Extensions.metadata` is never
   serialized. The new metadata enums are `#[non_exhaustive]`.
-
-
 ## [0.5.0] - 2026-10-13
 
 ### Added
@@ -652,8 +648,6 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 - **Each shipped preset records what it omits.** Auth0 and Keycloak put their roles claim where no preset can name it, so those need a hand-written `claim_map`. Presets leave a field empty rather than filling it with the wrong concept, because Keycloak's `groups` holds realm roles and Cognito's `cognito:roles` holds IAM role ARNs. Each preset's description says what it covers and what is opt-in at the provider. ([#31](https://github.com/praxis-proxy/policy/pull/31))
 
 - **Roles and permissions are readable as whole sets.** `subject.roles`, `subject.permissions`, `client.roles`, and `client.permissions` join `subject.teams` as `StringSet` bag keys, so a policy can write `"hr" in subject.roles` rather than enumerating `role.<name>` booleans. The flattened boolean keys are unchanged. ([#7](https://github.com/praxis-proxy/policy/pull/7))
-
-
 ### Changed
 
 - **`require(P)` is now a predicate meaning `!P`.** It accepts general predicates, including comparisons, negation, and composition with `&` or `|`. Existing accepted forms retain their semantics: `require(a)`, `require(a, b)`, and `require(a | b)` still normalize to the same trees.
@@ -834,8 +828,6 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 - **The unused `hooks::types::hook_names` and `hooks::types::cmf_hook_names` modules.** **Breaking for Rust callers**: import CMF names from `praxis_policy_core::cmf::constants`, alongside `identity::HOOK_IDENTITY_RESOLVE`, `delegation::HOOK_TOKEN_DELEGATE`, and `elicitation::HOOK_ELICIT`. Their operator-facing string values remain stable.
 
 - **`AplRouteHandler::with_pdp_router` is gone.** Install a `PdpRouter` through `with_pdp`, which is what the visitor already does. ([#13](https://github.com/praxis-proxy/policy/issues/13))
-
-
 ### Fixed
 
 - **Delegators and elicitation handlers are no longer reported as narrowed when their family-specific hooks are reached.** `delegate(...)` is credited to `token.delegate`, and elicitation verbs to `elicit`. Unreached hooks declared by those plugins are still reported.

@@ -27,11 +27,7 @@ pub struct CredentialLocation {
     pub prefix: Option<String>,
 }
 
-/// What reading the configured location produced.
-///
-/// The deny codes follow the names for the extraction phase, so two
-/// identity plugins report the same condition the same way and an
-/// operator's runbook holds for both.
+/// Outcome of reading a configured credential location.
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Extraction {
@@ -51,17 +47,14 @@ pub enum Extraction {
     /// The location held a value that does not carry this resolver's
     /// prefix.
     ///
-    /// Not a denial on its own. It is the multi-population case:
-    /// another resolver on the chain services this credential, so this
-    /// one declines and leaves the payload untouched.
+    /// This resolver declines without denying the request, so another
+    /// resolver can handle the credential.
     WrongPrefix,
 
     /// The credential name appeared more than once, or multiple
     /// same-logical-header entries with different casing exist.
     ///
-    /// Denies as `auth.ambiguous_credential`. Rejecting outright
-    /// rather than picking one prevents an attacker who can inject a
-    /// duplicate from silently overriding which value a resolver reads.
+    /// Denies as `auth.ambiguous_credential`.
     Ambiguous,
 
     /// The credential input is structurally malformed — a parse
@@ -71,13 +64,11 @@ pub enum Extraction {
     Malformed,
 }
 
-/// `value` without `prefix`, comparing the two without ASCII case.
 fn strip_prefix_ignore_case<'v>(value: &'v str, prefix: &str) -> Option<&'v str> {
     let (head, tail) = value.split_at_checked(prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then_some(tail)
 }
 
-/// Map a credential parse error to the appropriate `Extraction` variant.
 fn map_parse_error(e: http_credential::CredentialParseError) -> Extraction {
     use http_credential::CredentialParseError;
     match e {
@@ -101,18 +92,14 @@ impl CredentialLocation {
         }
     }
 
-    /// Read the raw value at the configured location, apply the prefix
-    /// gate, and return the credential value.
-    ///
-    /// For headers the lookup is case-insensitive. For cookies, parses
-    /// the `Cookie` header via `http_credential::parse_cookie_header`.
-    /// For query parameters, parses the raw query string via
-    /// `http_credential::parse_query_string`.
+    /// Read a credential from headers or a raw query string. Header names
+    /// are matched without ASCII case; the configured prefix selects which
+    /// credentials this resolver handles.
     ///
     /// # Errors
     ///
-    /// Returns the appropriate `Extraction` variant when the credential
-    /// is missing, empty, or does not match the configured prefix.
+    /// Returns an `Extraction` outcome when the credential is missing,
+    /// empty, ambiguous, malformed, or belongs to another resolver.
     pub fn raw(
         &self,
         headers: &HashMap<String, String>,
@@ -125,8 +112,6 @@ impl CredentialLocation {
         }
     }
 
-    /// Extract a credential from an HTTP header with case-insensitive
-    /// lookup and duplicate-casing ambiguity detection.
     fn extract_header(
         &self,
         headers: &HashMap<String, String>,
@@ -148,8 +133,6 @@ impl CredentialLocation {
         self.gate(raw).map(str::to_owned)
     }
 
-    /// Extract a credential from a cookie with duplicate-header and
-    /// duplicate-name ambiguity detection.
     fn extract_cookie(
         &self,
         headers: &HashMap<String, String>,
@@ -177,8 +160,6 @@ impl CredentialLocation {
         }
     }
 
-    /// Extract a credential from a query parameter with parse-error
-    /// mapping.
     fn extract_query_param(
         &self,
         raw_query_string: Option<&str>,
@@ -197,8 +178,6 @@ impl CredentialLocation {
         }
     }
 
-    /// Apply the prefix gate to a raw value, yielding the credential
-    /// itself.
     fn gate<'v>(&self, raw: &'v str) -> Result<&'v str, Extraction> {
         let after = match self.prefix.as_deref() {
             Some(prefix) => Self::strip_gate(raw, prefix)?,
@@ -210,7 +189,6 @@ impl CredentialLocation {
         Ok(after)
     }
 
-    /// Strip the scheme from `raw` and require the leader.
     fn strip_gate<'v>(raw: &'v str, prefix: &str) -> Result<&'v str, Extraction> {
         let Some((scheme, leader)) = prefix.split_once(' ') else {
             return raw
@@ -243,13 +221,12 @@ impl CredentialLocation {
         }
     }
 
-    /// Like [`raw`](Self::raw), but sources the query string from
-    /// `Extensions.http.query`.
+    /// Read a credential using the query string in `Extensions.http.query`.
     ///
     /// # Errors
     ///
-    /// Returns the appropriate `Extraction` variant when the credential
-    /// is missing, empty, or does not match the configured prefix.
+    /// Returns an `Extraction` outcome when the credential is missing,
+    /// empty, ambiguous, malformed, or belongs to another resolver.
     pub fn raw_from_ext(
         &self,
         headers: &HashMap<String, String>,
@@ -259,18 +236,12 @@ impl CredentialLocation {
         self.raw(headers, query)
     }
 
-    /// Reject a location no request can satisfy, at config load.
-    ///
-    /// Checks structural correctness for all three variants: non-empty
-    /// name, no interior whitespace, and for cookies, no `=` or `;` in
-    /// the name. Does not restrict which variants are allowed — that is
-    /// a plugin-level decision.
+    /// Validate a credential name and optional prefix before use.
     ///
     /// # Errors
     ///
-    /// An empty or whitespace-only name, a name with interior
-    /// whitespace, a cookie name containing `=` or `;`, or a prefix
-    /// that is empty or starts with a space.
+    /// Returns an error for an empty name or prefix, invalid name
+    /// characters, or a prefix starting with a space.
     pub fn validate(&self) -> Result<(), String> {
         let (kind, name) = match &self.credential {
             Credential::Header { name } => ("header", name.as_str()),

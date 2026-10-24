@@ -140,13 +140,7 @@ pub(crate) async fn invoke(
     invoke_with_payload(cfg, IdentityPayload::new(token, source)).await
 }
 
-/// Drive a pre-built `IdentityPayload` through the real handler pipeline.
-///
-/// [`invoke`] only lets a case set the bearer token and its `TokenSource` —
-/// there is no way to also populate headers or an HTTP extension. This
-/// variant takes the payload and extensions directly, so a cookie or
-/// query-param case can build the right inputs before driving them
-/// through the same pipeline `invoke` uses.
+/// Run a prepared payload through the identity hook.
 pub(crate) async fn invoke_with_payload(
     cfg: PluginConfig,
     payload: IdentityPayload,
@@ -154,8 +148,7 @@ pub(crate) async fn invoke_with_payload(
     invoke_with_payload_and_ext(cfg, payload, Extensions::default()).await
 }
 
-/// Drive a pre-built `IdentityPayload` + `Extensions` through the real
-/// handler pipeline.
+/// Run a prepared payload and extensions through the identity hook.
 pub(crate) async fn invoke_with_payload_and_ext(
     cfg: PluginConfig,
     payload: IdentityPayload,
@@ -178,7 +171,6 @@ pub(crate) async fn invoke_with_payload_and_ext(
     result
 }
 
-/// Build an `Extensions` carrying an `HttpExtension` with the given query.
 pub(crate) fn extensions_with_query(query: Option<String>) -> Extensions {
     use praxis_policy_core::extensions::HttpExtension;
     Extensions {
