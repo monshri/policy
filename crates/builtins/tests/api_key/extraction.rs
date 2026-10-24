@@ -43,6 +43,19 @@ async fn an_empty_credential_denies_separately_from_a_missing_one() {
     );
 }
 
+#[tokio::test]
+async fn an_empty_header_with_prefix_denies_as_empty() {
+    let file = one_record();
+    let resolver = resolver(file_config(file.path(), Some("Bearer "))).expect("the config builds");
+
+    let result = resolve_with_header(&resolver, "").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.empty_credential")
+    );
+}
+
 /// A value carrying only the scheme has no credential after it. It has to read
 /// as empty rather than reach the directory as a zero length key and come back
 /// reported as unknown.
@@ -106,10 +119,15 @@ async fn a_credential_without_this_resolvers_prefix_declines_rather_than_denies(
     );
 }
 
-/// RFC 7235 makes the auth scheme case-insensitive, and the JWT resolver
+// -----------------------------------------------------------------------------
+// RFC 9110 Section 11.1
+// -----------------------------------------------------------------------------
+/// [RFC 9110 Section 11.1] makes the auth scheme case-insensitive, and the JWT resolver
 /// already treats it that way. Two identity plugins disagreeing about whether
 /// `bearer` is `Bearer` would be a difference an operator discovers in
 /// production.
+///
+/// [RFC 9110 Section 11.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
 #[tokio::test]
 async fn the_auth_scheme_in_a_prefix_matches_without_case() {
     let file = one_record();
@@ -149,7 +167,13 @@ async fn the_credential_after_the_scheme_stays_case_sensitive() {
     );
 }
 
-/// A value merely starting with the scheme's letters is not that scheme.
+// -----------------------------------------------------------------------------
+// RFC 9110 Section 11.1
+// -----------------------------------------------------------------------------
+/// A value merely starting with the scheme's letters is not that scheme under
+/// [RFC 9110 Section 11.1].
+///
+/// [RFC 9110 Section 11.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
 #[tokio::test]
 async fn a_scheme_needs_a_space_after_it() {
     let file = one_record();
@@ -330,6 +354,19 @@ async fn a_duplicate_cookie_name_denies_as_ambiguous() {
 }
 
 #[tokio::test]
+async fn a_malformed_cookie_denies_as_malformed() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve_with_cookie(&resolver, "api_key=sk-oai-secret\r\nInjected: value").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.malformed_credential")
+    );
+}
+
+#[tokio::test]
 async fn a_query_param_credential_resolves_an_identity() {
     let file = one_record();
     let resolver =
@@ -398,5 +435,19 @@ async fn a_duplicate_query_param_name_denies_as_ambiguous() {
         denial_code(&result).as_deref(),
         Some("auth.ambiguous_credential"),
         "a duplicate credential query param must not resolve"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_query_param_denies_as_malformed() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "api_key=sk-oai-secret\r\nInjected: value").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.malformed_credential")
     );
 }

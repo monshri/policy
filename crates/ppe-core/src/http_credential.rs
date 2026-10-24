@@ -164,8 +164,8 @@ pub fn parse_cookie_header(
 /// Names and values remain literal; percent escapes are not decoded.
 /// A name without `=` has an empty value. Duplicate occurrences of
 /// `credential_name` are rejected; other duplicates keep their first value.
-/// An encoded name that would match `credential_name` is rejected when
-/// no literal match is present.
+/// An encoded name that would match `credential_name` is rejected, including
+/// when the literal name is also present.
 ///
 /// # Errors
 ///
@@ -208,16 +208,20 @@ pub fn parse_query_string(
         )?;
     }
 
-    if !out.contains_key(credential_name) {
-        for key in out.keys() {
-            if let Some(decoded) = percent_decode_name(key)
-                && decoded == credential_name
-            {
-                return Err(CredentialParseError::PercentEncodedName {
-                    encoded: key.clone(),
-                    credential: credential_name.to_owned(),
+    for key in out.keys() {
+        if let Some(decoded) = percent_decode_name(key)
+            && decoded == credential_name
+        {
+            if out.contains_key(credential_name) {
+                return Err(CredentialParseError::Duplicate {
+                    location: "query_param",
+                    name: credential_name.to_owned(),
                 });
             }
+            return Err(CredentialParseError::PercentEncodedName {
+                encoded: key.clone(),
+                credential: credential_name.to_owned(),
+            });
         }
     }
 
@@ -225,15 +229,9 @@ pub fn parse_query_string(
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::get_unwrap,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::print_stderr,
-    clippy::print_stdout,
+#[expect(
     clippy::unwrap_used,
-    reason = "tests"
+    reason = "tests unwrap known parser outcomes to inspect their values"
 )]
 mod tests {
     use super::*;
@@ -500,10 +498,16 @@ mod tests {
     }
 
     #[test]
-    fn query_literal_credential_name_skips_decode_check() {
-        let m = parse_query_string("access_token=eyJ.tok&access%5Ftoken=other", "access_token")
-            .unwrap();
-        assert_eq!(m.get("access_token").map(String::as_str), Some("eyJ.tok"));
+    fn query_literal_and_encoded_credential_names_are_ambiguous() {
+        let err = parse_query_string("access_token=eyJ.tok&access%5Ftoken=other", "access_token")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CredentialParseError::Duplicate {
+                location: "query_param",
+                name: "access_token".into(),
+            }
+        );
     }
 
     #[test]

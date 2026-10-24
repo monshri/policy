@@ -126,7 +126,22 @@ fn query_param_credential_builds_at_config_load() {
     ));
     let mut block = file_config(file.path(), None);
     block["credential"] = serde_json::json!({ "kind": "query_param", "name": "api_key" });
+    let mut config = plugin_config(block);
+    config.capabilities.insert("read_query".to_owned());
     ApiKeyIdentityFactory
-        .create(&plugin_config(block))
+        .create(&config)
         .expect("query_param credential must build");
+}
+
+#[test]
+fn query_param_credential_requires_read_query() {
+    let file = RecordFile::write("keys: []\n");
+    let mut block = file_config(file.path(), None);
+    block["credential"] = serde_json::json!({ "kind": "query_param", "name": "api_key" });
+
+    let error = ApiKeyIdentityFactory
+        .create(&plugin_config(block))
+        .err()
+        .expect("query credentials need read_query");
+    assert!(error.to_string().contains("read_query"), "got: {error}");
 }

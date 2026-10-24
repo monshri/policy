@@ -25,7 +25,7 @@ pub mod payload;
 /// Per-route identity configuration.
 pub mod route_config;
 
-pub use credential::{CredentialLocation, Extraction};
+pub use credential::{CredentialLocation, ExtractionError};
 pub use hook::{HOOK_IDENTITY_RESOLVE, IdentityHook};
 pub use mapping::{
     ClaimMap, ClaimMapConfig, ClaimMapper, ClaimPath, ConfiguredClaimMap, MappingProfile,

@@ -65,8 +65,8 @@ are rejected.
 Duplicate occurrences of the configured credential name are ambiguous;
 repeated unrelated names keep their first value. Cookie and query values
 remain literal, without percent decoding. A percent-encoded query name
-that would match the configured name is rejected when no literal match is
-present.
+that would match the configured name is rejected, including when the literal
+name is also present.
 
 A query token can appear in access logs, CDN logs, and browser history.
 The resolver logs a notice when a query location is configured so operators

@@ -57,7 +57,7 @@ pub mod resolver;
 
 pub use cache::{CacheConfig, CachingDirectory};
 pub use config::{ApiKeyResolverConfig, ExpiryPolicy, OnDirectoryError, ProviderConfig};
-pub use credential::{CredentialLocation, Extraction};
+pub use credential::{CredentialLocation, ExtractionError};
 pub use directory::{DirectoryError, KeyDirectory, KeyRecord, PresentedKey};
 pub use factory::{ApiKeyIdentityFactory, KIND};
 pub use file_directory::{FileDirectory, FileDirectoryConfig, FileRecord, IndexKind, RecordFile};

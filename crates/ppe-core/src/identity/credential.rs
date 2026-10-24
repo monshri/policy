@@ -20,20 +20,20 @@ pub struct CredentialLocation {
     /// What the value must start with to be one this resolver services.
     ///
     /// A prefix such as `Bearer sk-oai-` accepts `Bearer sk-oai-abc` and
-    /// yields `sk-oai-abc`. The auth scheme is case-insensitive; the key
-    /// leader is case-sensitive and stays in the presented credential.
+    /// yields `sk-oai-abc`. The auth scheme is case-insensitive and separated
+    /// from the key by one or more spaces per [RFC 9110 Section 11.1]. The
+    /// key leader is case-sensitive and stays in the presented credential.
     /// A prefix without a space is entirely a key leader. `None` accepts
     /// every value at the configured location.
+    ///
+    /// [RFC 9110 Section 11.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
     pub prefix: Option<String>,
 }
 
-/// Outcome of reading a configured credential location.
+/// Why a configured credential location did not yield a credential.
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
-pub enum Extraction {
-    /// A credential this resolver services.
-    Found,
-
+pub enum ExtractionError {
     /// Nothing was supplied at the configured location.
     ///
     /// Denies as `auth.missing_credential`.
@@ -69,11 +69,27 @@ fn strip_prefix_ignore_case<'v>(value: &'v str, prefix: &str) -> Option<&'v str>
     head.eq_ignore_ascii_case(prefix).then_some(tail)
 }
 
-fn map_parse_error(e: http_credential::CredentialParseError) -> Extraction {
+fn map_parse_error(e: http_credential::CredentialParseError) -> ExtractionError {
     use http_credential::CredentialParseError;
     match e {
-        CredentialParseError::Duplicate { .. } => Extraction::Ambiguous,
-        _ => Extraction::Malformed,
+        CredentialParseError::Duplicate { .. } => ExtractionError::Ambiguous,
+        _ => ExtractionError::Malformed,
+    }
+}
+
+fn single_header_ci<'h>(
+    headers: &'h HashMap<String, String>,
+    name: &str,
+) -> Result<&'h str, ExtractionError> {
+    let mut matches = headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str());
+
+    match (matches.next(), matches.next()) {
+        (None, _) => Err(ExtractionError::Missing),
+        (Some(value), None) => Ok(value),
+        (Some(_), Some(_)) => Err(ExtractionError::Ambiguous),
     }
 }
 
@@ -98,13 +114,13 @@ impl CredentialLocation {
     ///
     /// # Errors
     ///
-    /// Returns an `Extraction` outcome when the credential is missing,
+    /// Returns an [`ExtractionError`] when the credential is missing,
     /// empty, ambiguous, malformed, or belongs to another resolver.
     pub fn raw(
         &self,
         headers: &HashMap<String, String>,
         raw_query_string: Option<&str>,
-    ) -> Result<String, Extraction> {
+    ) -> Result<String, ExtractionError> {
         match &self.credential {
             Credential::Header { name } => self.extract_header(headers, name),
             Credential::Cookie { name } => self.extract_cookie(headers, name),
@@ -116,20 +132,8 @@ impl CredentialLocation {
         &self,
         headers: &HashMap<String, String>,
         name: &str,
-    ) -> Result<String, Extraction> {
-        let name_lc = name.to_ascii_lowercase();
-        let matches: Vec<&str> = headers
-            .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case(&name_lc))
-            .map(|(_, v)| v.as_str())
-            .collect();
-
-        let raw = match matches.as_slice() {
-            [single] => single,
-            [] => return Err(Extraction::Missing),
-            _ => return Err(Extraction::Ambiguous),
-        };
-
+    ) -> Result<String, ExtractionError> {
+        let raw = single_header_ci(headers, name)?;
         self.gate(raw).map(str::to_owned)
     }
 
@@ -137,25 +141,14 @@ impl CredentialLocation {
         &self,
         headers: &HashMap<String, String>,
         name: &str,
-    ) -> Result<String, Extraction> {
-        let cookie_values: Vec<&str> = headers
-            .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
-            .map(|(_, v)| v.as_str())
-            .collect();
-
-        let cookie_header = match cookie_values.as_slice() {
-            [single] => single,
-            [] => return Err(Extraction::Missing),
-            _ => return Err(Extraction::Ambiguous),
-        };
+    ) -> Result<String, ExtractionError> {
+        let cookie_header = single_header_ci(headers, "cookie")?;
 
         let cookies =
             http_credential::parse_cookie_header(cookie_header, name).map_err(map_parse_error)?;
 
         match cookies.get(name) {
-            None => Err(Extraction::Missing),
-            Some(v) if v.is_empty() => Err(Extraction::Empty),
+            None => Err(ExtractionError::Missing),
             Some(v) => self.gate(v).map(str::to_owned),
         }
     }
@@ -164,74 +157,65 @@ impl CredentialLocation {
         &self,
         raw_query_string: Option<&str>,
         name: &str,
-    ) -> Result<String, Extraction> {
+    ) -> Result<String, ExtractionError> {
         let Some(qs) = raw_query_string else {
-            return Err(Extraction::Missing);
+            return Err(ExtractionError::Missing);
         };
 
         let params = http_credential::parse_query_string(qs, name).map_err(map_parse_error)?;
 
         match params.get(name) {
-            None => Err(Extraction::Missing),
-            Some(v) if v.is_empty() => Err(Extraction::Empty),
+            None => Err(ExtractionError::Missing),
             Some(v) => self.gate(v).map(str::to_owned),
         }
     }
 
-    fn gate<'v>(&self, raw: &'v str) -> Result<&'v str, Extraction> {
+    fn gate<'v>(&self, raw: &'v str) -> Result<&'v str, ExtractionError> {
+        if raw.is_empty() {
+            return Err(ExtractionError::Empty);
+        }
         let after = match self.prefix.as_deref() {
             Some(prefix) => Self::strip_gate(raw, prefix)?,
             None => raw,
         };
         if after.is_empty() {
-            return Err(Extraction::Empty);
+            return Err(ExtractionError::Empty);
         }
         Ok(after)
     }
 
-    fn strip_gate<'v>(raw: &'v str, prefix: &str) -> Result<&'v str, Extraction> {
+    fn strip_gate<'v>(raw: &'v str, prefix: &str) -> Result<&'v str, ExtractionError> {
         let Some((scheme, leader)) = prefix.split_once(' ') else {
             return raw
                 .starts_with(prefix)
                 .then_some(raw)
-                .ok_or(Extraction::WrongPrefix);
+                .ok_or(ExtractionError::WrongPrefix);
         };
 
-        let after_scheme = strip_prefix_ignore_case(raw, scheme).ok_or(Extraction::WrongPrefix)?;
+        let after_scheme =
+            strip_prefix_ignore_case(raw, scheme).ok_or(ExtractionError::WrongPrefix)?;
         let credential = after_scheme.trim_start_matches(' ');
         if credential.len() == after_scheme.len() {
-            return Err(Extraction::WrongPrefix);
+            return Err(ExtractionError::WrongPrefix);
         }
 
         credential
             .starts_with(leader.trim_start_matches(' '))
             .then_some(credential)
-            .ok_or(Extraction::WrongPrefix)
-    }
-
-    /// What reading the configured location produced.
-    pub fn extract(
-        &self,
-        headers: &HashMap<String, String>,
-        raw_query_string: Option<&str>,
-    ) -> Extraction {
-        match self.raw(headers, raw_query_string) {
-            Ok(_) => Extraction::Found,
-            Err(outcome) => outcome,
-        }
+            .ok_or(ExtractionError::WrongPrefix)
     }
 
     /// Read a credential using the query string in `Extensions.http.query`.
     ///
     /// # Errors
     ///
-    /// Returns an `Extraction` outcome when the credential is missing,
+    /// Returns an [`ExtractionError`] when the credential is missing,
     /// empty, ambiguous, malformed, or belongs to another resolver.
     pub fn raw_from_ext(
         &self,
         headers: &HashMap<String, String>,
         ext: &Extensions,
-    ) -> Result<String, Extraction> {
+    ) -> Result<String, ExtractionError> {
         let query = ext.http.as_ref().and_then(|h| h.query.as_deref());
         self.raw(headers, query)
     }
@@ -269,6 +253,15 @@ impl CredentialLocation {
             return Err(format!(
                 "`credential: {{ kind: query_param, name: '{name}' }}` \
                  must not contain '&' or '='"
+            ));
+        }
+        if matches!(
+            self.credential,
+            Credential::Header { .. } | Credential::Cookie { .. }
+        ) && http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+        {
+            return Err(format!(
+                "`credential: {{ kind: {kind}, name: '{name}' }}` must be a valid HTTP token"
             ));
         }
         if self.prefix.as_ref().is_some_and(String::is_empty) {
@@ -329,20 +322,12 @@ mod tests {
         assert_eq!(query.name(), "access_token");
     }
 
-    #[test]
-    fn extraction_variants_are_reachable() {
-        for variant in [
-            Extraction::Found,
-            Extraction::Missing,
-            Extraction::Empty,
-            Extraction::WrongPrefix,
-            Extraction::Ambiguous,
-            Extraction::Malformed,
-        ] {
-            let _debug = format!("{variant:?}");
-        }
-    }
-
+    // -----------------------------------------------------------------------------
+    // RFC 9110 Section 11.1
+    // -----------------------------------------------------------------------------
+    /// Scheme matching follows [RFC 9110 Section 11.1].
+    ///
+    /// [RFC 9110 Section 11.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
     #[test]
     fn strip_prefix_ignore_case_preserves_existing_behavior() {
         assert_eq!(
@@ -361,6 +346,12 @@ mod tests {
         assert_eq!(strip_prefix_ignore_case("Be", "Bearer"), None);
     }
 
+    // -----------------------------------------------------------------------------
+    // RFC 9110 Section 11.1
+    // -----------------------------------------------------------------------------
+    /// Scheme matching follows [RFC 9110 Section 11.1].
+    ///
+    /// [RFC 9110 Section 11.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
     #[test]
     fn prefix_gate_scheme_only() {
         let loc = CredentialLocation::new(
@@ -372,7 +363,7 @@ mod tests {
         assert_eq!(loc.gate("Bearer tok").unwrap(), "tok");
         assert_eq!(loc.gate("bearer tok").unwrap(), "tok");
         assert_eq!(loc.gate("bearer   tok").unwrap(), "tok");
-        assert_eq!(loc.gate("Basic tok"), Err(Extraction::WrongPrefix));
+        assert_eq!(loc.gate("Basic tok"), Err(ExtractionError::WrongPrefix));
     }
 
     #[test]
@@ -384,9 +375,15 @@ mod tests {
             Some("sk-oai-".into()),
         );
         assert_eq!(loc.gate("sk-oai-abc").unwrap(), "sk-oai-abc");
-        assert_eq!(loc.gate("pk-live-abc"), Err(Extraction::WrongPrefix));
+        assert_eq!(loc.gate("pk-live-abc"), Err(ExtractionError::WrongPrefix));
     }
 
+    // -----------------------------------------------------------------------------
+    // RFC 9110 Section 11.1
+    // -----------------------------------------------------------------------------
+    /// Scheme matching follows [RFC 9110 Section 11.1].
+    ///
+    /// [RFC 9110 Section 11.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
     #[test]
     fn prefix_gate_scheme_plus_leader() {
         let loc = CredentialLocation::new(
@@ -397,7 +394,10 @@ mod tests {
         );
         assert_eq!(loc.gate("Bearer sk-oai-abc").unwrap(), "sk-oai-abc");
         assert_eq!(loc.gate("bearer sk-oai-abc").unwrap(), "sk-oai-abc");
-        assert_eq!(loc.gate("Bearer pk-live-abc"), Err(Extraction::WrongPrefix));
+        assert_eq!(
+            loc.gate("Bearer pk-live-abc"),
+            Err(ExtractionError::WrongPrefix)
+        );
     }
 
     #[test]
@@ -409,7 +409,7 @@ mod tests {
             None,
         );
         assert_eq!(loc.gate("any-value").unwrap(), "any-value");
-        assert_eq!(loc.gate(""), Err(Extraction::Empty));
+        assert_eq!(loc.gate(""), Err(ExtractionError::Empty));
     }
 
     #[test]
@@ -424,7 +424,6 @@ mod tests {
         headers.insert("authorization".to_owned(), "Bearer my-jwt".to_owned());
 
         assert_eq!(loc.raw(&headers, None).unwrap(), "my-jwt");
-        assert_eq!(loc.extract(&headers, None), Extraction::Found);
     }
 
     #[test]
@@ -436,7 +435,7 @@ mod tests {
             None,
         );
         let headers = HashMap::new();
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Missing));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Missing));
     }
 
     #[test]
@@ -449,7 +448,19 @@ mod tests {
         );
         let mut headers = HashMap::new();
         headers.insert("x-api-key".to_owned(), String::new());
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Empty));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Empty));
+    }
+
+    #[test]
+    fn header_extraction_empty_with_prefix() {
+        let loc = CredentialLocation::new(
+            Credential::Header {
+                name: "Authorization".into(),
+            },
+            Some("Bearer ".into()),
+        );
+        let headers = HashMap::from([("Authorization".to_owned(), String::new())]);
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Empty));
     }
 
     #[test]
@@ -477,7 +488,7 @@ mod tests {
             None,
         );
         let headers = HashMap::new();
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Missing));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Missing));
     }
 
     #[test]
@@ -490,7 +501,7 @@ mod tests {
         );
         let mut headers = HashMap::new();
         headers.insert("cookie".to_owned(), "analytics=x; theme=dark".to_owned());
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Missing));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Missing));
     }
 
     #[test]
@@ -503,7 +514,7 @@ mod tests {
         );
         let mut headers = HashMap::new();
         headers.insert("cookie".to_owned(), "session=".to_owned());
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Empty));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Empty));
     }
 
     #[test]
@@ -532,7 +543,7 @@ mod tests {
             None,
         );
         let headers = HashMap::new();
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Missing));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Missing));
     }
 
     #[test]
@@ -546,7 +557,7 @@ mod tests {
         let headers = HashMap::new();
         assert_eq!(
             loc.raw(&headers, Some("page=1&limit=10")),
-            Err(Extraction::Missing)
+            Err(ExtractionError::Missing)
         );
     }
 
@@ -561,7 +572,7 @@ mod tests {
         let headers = HashMap::new();
         assert_eq!(
             loc.raw(&headers, Some("access_token=")),
-            Err(Extraction::Empty)
+            Err(ExtractionError::Empty)
         );
     }
 
@@ -616,6 +627,23 @@ mod tests {
             None,
         );
         assert!(loc.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_token_header_and_cookie_names() {
+        for credential in [
+            Credential::Header {
+                name: "bad:name".into(),
+            },
+            Credential::Cookie {
+                name: "bad/name".into(),
+            },
+        ] {
+            let error = CredentialLocation::new(credential, None)
+                .validate()
+                .unwrap_err();
+            assert!(error.contains("valid HTTP token"), "got: {error}");
+        }
     }
 
     #[test]
@@ -689,7 +717,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("authorization".to_owned(), "Bearer tok1".to_owned());
         headers.insert("Authorization".to_owned(), "Bearer tok2".to_owned());
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Ambiguous));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Ambiguous));
     }
 
     #[test]
@@ -703,7 +731,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("cookie".to_owned(), "session=abc".to_owned());
         headers.insert("Cookie".to_owned(), "session=def".to_owned());
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Ambiguous));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Ambiguous));
     }
 
     #[test]
@@ -711,7 +739,7 @@ mod tests {
         let loc = CredentialLocation::new(Credential::Cookie { name: "jwt".into() }, None);
         let mut headers = HashMap::new();
         headers.insert("cookie".to_owned(), "jwt=a; jwt=b".to_owned());
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Ambiguous));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Ambiguous));
     }
 
     #[test]
@@ -725,7 +753,7 @@ mod tests {
         let headers = HashMap::new();
         assert_eq!(
             loc.raw(&headers, Some("token=a&token=b")),
-            Err(Extraction::Ambiguous)
+            Err(ExtractionError::Ambiguous)
         );
     }
 
@@ -740,7 +768,7 @@ mod tests {
         let headers = HashMap::new();
         assert_eq!(
             loc.raw(&headers, Some("access%5Ftoken=eyJ.tok")),
-            Err(Extraction::Malformed)
+            Err(ExtractionError::Malformed)
         );
     }
 
@@ -749,7 +777,7 @@ mod tests {
         let loc = CredentialLocation::new(Credential::Cookie { name: "jwt".into() }, None);
         let mut headers = HashMap::new();
         headers.insert("cookie".to_owned(), "jwt=a\r\nInjected: header".to_owned());
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Malformed));
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Malformed));
     }
 
     #[test]
@@ -791,30 +819,8 @@ mod tests {
         let headers = HashMap::new();
         assert_eq!(
             loc.raw(&headers, Some("token=pk-abc123")),
-            Err(Extraction::WrongPrefix)
+            Err(ExtractionError::WrongPrefix)
         );
-    }
-
-    #[test]
-    fn extract_returns_ambiguous_for_duplicate_headers() {
-        let loc = CredentialLocation::new(
-            Credential::Header {
-                name: "Authorization".into(),
-            },
-            None,
-        );
-        let mut headers = HashMap::new();
-        headers.insert("authorization".to_owned(), "tok1".to_owned());
-        headers.insert("Authorization".to_owned(), "tok2".to_owned());
-        assert_eq!(loc.extract(&headers, None), Extraction::Ambiguous);
-    }
-
-    #[test]
-    fn extract_returns_malformed_for_control_character_cookie() {
-        let loc = CredentialLocation::new(Credential::Cookie { name: "jwt".into() }, None);
-        let mut headers = HashMap::new();
-        headers.insert("cookie".to_owned(), "jwt=a\r\nEvil: header".to_owned());
-        assert_eq!(loc.extract(&headers, None), Extraction::Malformed);
     }
 
     #[test]
@@ -823,8 +829,7 @@ mod tests {
         let mut headers = HashMap::new();
         let oversize = format!("jwt={}", "x".repeat(16 * 1024 + 1));
         headers.insert("cookie".to_owned(), oversize);
-        assert_eq!(loc.raw(&headers, None), Err(Extraction::Malformed));
-        assert_eq!(loc.extract(&headers, None), Extraction::Malformed);
+        assert_eq!(loc.raw(&headers, None), Err(ExtractionError::Malformed));
     }
 
     #[test]
@@ -839,11 +844,7 @@ mod tests {
         let oversize = format!("token={}", "x".repeat(16 * 1024 + 1));
         assert_eq!(
             loc.raw(&headers, Some(&oversize)),
-            Err(Extraction::Malformed)
-        );
-        assert_eq!(
-            loc.extract(&headers, Some(&oversize)),
-            Extraction::Malformed
+            Err(ExtractionError::Malformed)
         );
     }
 
@@ -858,7 +859,7 @@ mod tests {
         let headers = HashMap::new();
         assert_eq!(
             loc.raw(&headers, Some("")),
-            Err(Extraction::Missing),
+            Err(ExtractionError::Missing),
             "an empty query string has no parameters"
         );
     }

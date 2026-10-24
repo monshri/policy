@@ -113,6 +113,11 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   failure). Malformed JWTs use
   `auth.malformed_credential` at every credential location.
 
+  Query credentials require `read_query` at configuration load for both JWT
+  and API-key resolvers. Header and cookie credential names must be valid HTTP
+  tokens. A literal query credential name alongside a percent-encoded copy is
+  rejected as ambiguous.
+
   **Security note**: a resolver configured for `credential: { kind: query_param
   }` logs a one-time notice at construction, because a query-parameter token
   routinely appears in infrastructure logs (access logs, CDN logs, browser

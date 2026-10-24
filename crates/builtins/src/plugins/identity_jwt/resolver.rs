@@ -67,7 +67,7 @@ use praxis_policy_core::extensions::raw_credentials::{
 };
 use praxis_policy_core::hooks::payload::Extensions;
 use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
-use praxis_policy_core::identity::credential::{CredentialLocation, Extraction};
+use praxis_policy_core::identity::credential::{CredentialLocation, ExtractionError};
 use praxis_policy_core::identity::{IdentityHook, IdentityPayload};
 use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
@@ -415,14 +415,7 @@ impl JwtIdentityResolver {
 
         // The JWT resolver accepts bare tokens; the prefix gate would reject them.
         let location = CredentialLocation::new(credential.clone(), None);
-        location.validate().map_err(|e| {
-            Box::new(PluginError::Config {
-                message: format!(
-                    "plugin '{}' (praxis-policy-plugin-identity-jwt): {e}",
-                    cfg.name
-                ),
-            })
-        })?;
+        location.validate().map_err(&config_error)?;
 
         if uses_legacy_header && let Credential::Header { name } = &credential {
             tracing::warn!(
@@ -434,6 +427,11 @@ impl JwtIdentityResolver {
 
         // Infrastructure may log raw URLs, so warn before serving requests.
         if matches!(credential, Credential::QueryParam { .. }) {
+            if !cfg.capabilities.contains("read_query") {
+                return Err(config_error(
+                    "`credential.kind: query_param` needs the `read_query` capability".to_owned(),
+                ));
+            }
             tracing::warn!(
                 plugin = %cfg.name,
                 "resolver '{}' configured for query_param credential — ensure infrastructure \
@@ -814,23 +812,23 @@ impl JwtIdentityResolver {
             .raw_from_ext(payload.headers(), ext)
             .map_err(|extraction| {
                 Box::new(match extraction {
-                    Extraction::Missing => PluginViolation::new(
+                    ExtractionError::Missing => PluginViolation::new(
                         "auth.missing_credential",
                         format!("{} not found in request", self.location.credential),
                     ),
-                    Extraction::Empty => PluginViolation::new(
+                    ExtractionError::Empty => PluginViolation::new(
                         "auth.empty_credential",
                         format!("{} is present but empty", self.location.credential),
                     ),
-                    Extraction::Ambiguous => PluginViolation::new(
+                    ExtractionError::Ambiguous => PluginViolation::new(
                         "auth.ambiguous_credential",
                         format!("ambiguous credential at {}", self.location.credential),
                     ),
-                    Extraction::Malformed => PluginViolation::new(
+                    ExtractionError::Malformed => PluginViolation::new(
                         "auth.malformed_credential",
                         format!("malformed credential at {}", self.location.credential),
                     ),
-                    Extraction::WrongPrefix => PluginViolation::new(
+                    ExtractionError::WrongPrefix => PluginViolation::new(
                         "auth.missing_credential",
                         format!(
                             "{} does not match the configured prefix",
@@ -2421,8 +2419,8 @@ mod tests {
         JwtIdentityResolver::new(cfg).expect("a valid resolver config")
     }
 
-    fn resolver_on_query_param(name: &str) -> JwtIdentityResolver {
-        let cfg = cfg_with_config(
+    fn query_param_resolver_config(name: &str) -> PluginConfig {
+        cfg_with_config(
             "jwt",
             serde_json::json!({
                 "trusted_issuers": [{
@@ -2434,8 +2432,20 @@ mod tests {
                 "credential": { "kind": "query_param", "name": name },
                 "claim_mapper": "standard",
             }),
-        );
+        )
+    }
+
+    fn resolver_on_query_param(name: &str) -> JwtIdentityResolver {
+        let mut cfg = query_param_resolver_config(name);
+        cfg.capabilities.insert("read_query".to_owned());
         JwtIdentityResolver::new(cfg).expect("a valid resolver config")
+    }
+
+    #[test]
+    fn query_param_credential_requires_read_query() {
+        let error = JwtIdentityResolver::new(query_param_resolver_config("access_token"))
+            .expect_err("query credentials need read_query");
+        assert!(error.to_string().contains("read_query"), "got: {error}");
     }
 
     #[tokio::test]
@@ -2505,7 +2515,11 @@ mod tests {
     async fn an_oversized_cookie_header_denies_as_malformed() {
         let resolver = resolver_on_cookie("__Host-jwt");
         let mut headers = HashMap::new();
-        let oversized = format!("__Host-jwt={}", "x".repeat(9 * 1024));
+        let oversized = format!("__Host-jwt={}", "x".repeat(17 * 1024));
+        assert!(matches!(
+            praxis_policy_core::http_credential::parse_cookie_header(&oversized, "__Host-jwt"),
+            Err(praxis_policy_core::http_credential::CredentialParseError::TooLong { .. })
+        ));
         headers.insert("cookie".to_owned(), oversized);
         let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
         assert_eq!(
@@ -2590,7 +2604,11 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_query_string_denies_as_malformed() {
         let resolver = resolver_on_query_param("access_token");
-        let oversized = format!("access_token={}", "x".repeat(9 * 1024));
+        let oversized = format!("access_token={}", "x".repeat(17 * 1024));
+        assert!(matches!(
+            praxis_policy_core::http_credential::parse_query_string(&oversized, "access_token"),
+            Err(praxis_policy_core::http_credential::CredentialParseError::TooLong { .. })
+        ));
         let payload = IdentityPayload::new("", TokenSource::Bearer);
         assert_eq!(
             deny_code_for_ext(&resolver, payload, ext_with_query(oversized)).await,

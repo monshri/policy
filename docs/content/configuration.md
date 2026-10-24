@@ -154,7 +154,8 @@ credential:
 
 For query credentials, the host must populate `HttpExtension.query` with the
 raw query string, without the leading `?`. It must grant the resolver
-`read_query`; PPE does not extract the query from `HttpExtension.path`.
+`read_query`; configuration loading fails without that capability. PPE does
+not extract the query from `HttpExtension.path`.
 
 Omitting both `credential:` and `header:` defaults to
 `{ kind: header, name: Authorization }`.

@@ -70,13 +70,17 @@ pub fn hash(key: &str) -> String {
 
 /// Build a resolver from a `config:` block.
 pub fn resolver(block: serde_json::Value) -> Result<ApiKeyIdentityResolver, String> {
-    let config = PluginConfig {
+    let query_credential = block["credential"]["kind"] == "query_param";
+    let mut config = PluginConfig {
         name: "api-keys".into(),
         kind: KIND.into(),
         hooks: vec!["identity.resolve".to_owned()],
         config: Some(block),
         ..Default::default()
     };
+    if query_credential {
+        config.capabilities.insert("read_query".to_owned());
+    }
     ApiKeyIdentityResolver::new(config).map_err(|e| e.to_string())
 }
 
