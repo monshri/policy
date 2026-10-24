@@ -135,6 +135,14 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   `credential: Some(Credential::Header { name })` for new Rust callers. The
   YAML `header:` setting remains supported with a deprecation warning.
 
+- **Breaking Rust API for API-key embedders:**
+  `identity_api_key::Extraction` is no longer exported, and
+  `CredentialLocation::extract` and `CredentialLocation::presented` are
+  removed. Use `CredentialLocation::raw(&headers, raw_query_string)` or
+  `CredentialLocation::raw_from_ext(&headers, &ext)`; success is `Ok(String)`
+  and failures use `ExtractionError`. Move successful key bytes into
+  `PresentedKey::new(raw.into_bytes())` before a directory lookup.
+
 - **Breaking serialized shapes for embedders:** `RawInboundToken` now emits
   `{"source":{"kind":"header","name":"Authorization"}}` instead of
   `{"source_header":"Authorization"}`. Migrate persisted or wire JSON that
