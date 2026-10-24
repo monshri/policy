@@ -96,7 +96,7 @@ pub struct OcsfAuditEmitter {
 }
 
 const MAX_PENDING_WRITES: usize = 4;
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "MAX_PENDING_WRITES is a small compile-time constant"
 )]
@@ -2269,10 +2269,10 @@ mod tests {
 
     #[tokio::test]
     async fn drain_waits_for_all_in_flight_writes_before_flushing() {
+        let (blocking, entered, release) = blocking_exporter();
         let capture = Arc::new(Capture::default());
         let mut emitter = OcsfAuditEmitter::new(sink_cfg(json!({}))).unwrap();
-        let exporter: Arc<dyn AuditExporter> = capture.clone();
-        emitter.exporters = vec![exporter];
+        emitter.exporters = vec![blocking, capture.clone()];
         let emitter = Arc::new(emitter);
 
         let mut handles = Vec::new();
@@ -2290,14 +2290,26 @@ mod tests {
             }));
         }
 
-        for h in handles {
-            h.await.unwrap();
-        }
+        entered.await.unwrap();
+        let mut drain = {
+            let emitter = Arc::clone(&emitter);
+            tokio::spawn(async move { emitter.drain_and_flush(Duration::from_secs(5)).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut drain)
+                .await
+                .is_err(),
+            "drain must wait while a write is in flight"
+        );
+        assert_eq!(capture.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        emitter
-            .drain_and_flush(Duration::from_secs(5))
-            .await
-            .unwrap();
+        for _ in 0..MAX_PENDING_WRITES {
+            release.send(()).unwrap();
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        drain.await.unwrap().unwrap();
 
         let records = capture.records.lock().unwrap();
         assert_eq!(
