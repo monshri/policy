@@ -79,9 +79,10 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   the same credential regardless of which proxy sits in front of it. DPoP
   requires a header credential; cookie and query parameter locations are
   refused at load when an issuer enables DPoP.
-  The legacy `header:` setting remains supported but logs a deprecation
-  warning when the resolver is built. New configurations should use
-  `credential:`; the two settings cannot be combined:
+  The legacy YAML `header:` setting remains supported but logs a deprecation
+  warning when the resolver is built. Existing configurations need no change.
+  New configurations should use `credential:`; the two settings cannot be
+  combined:
 
   ```yaml
   # Legacy (still supported)
@@ -121,25 +122,22 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
-- **Breaking for embedders**: `RawInboundToken.source_header: String` is
-  replaced by `RawInboundToken.source: Credential`, and its constructor becomes
-  `RawInboundToken::new(token, source: Credential, kind)`. The serialized JSON
-  shape changes from `{"source_header":"Authorization"}` to
-  `{"source":{"kind":"header","name":"Authorization"}}` — the value is now a
-  `Credential` object, not a plain string, so persisted or wire JSON using the
-  old shape must be migrated. `Credential` (in
-  `praxis_policy_core::extensions`) is the new shared type recording where any
-  identity plugin extracted a credential from, so downstream consumers can
-  read a uniform location type. `RawInboundToken`'s `Debug` continues to
-  redact the token.
+- **Breaking Rust API for embedders:** `RawInboundToken.source_header: String`
+  becomes `RawInboundToken.source: Credential`; its constructor now takes a
+  `Credential` instead of a header name. `JwtIdentityResolverConfig.header`
+  changes from `String` to `Option<String>`, and struct literals must set the
+  new `credential: Option<Credential>` field. Use `header: None` with
+  `credential: Some(Credential::Header { name })` for new Rust callers. The
+  YAML `header:` setting remains supported with a deprecation warning.
 
-  `IdentityPayload.headers` is now `#[serde(skip)]` — the field is no longer
-  included in serialized output. Previously it was `skip_serializing_if =
-  "HashMap::is_empty"`, which could include request headers in serialized
-  payloads when non-empty. Headers may carry credentials and must not appear
-  in serialized output. Out-of-process hosts that relied on receiving headers
-  through serialized `IdentityPayload` should read them from the input request
-  directly.
+- **Breaking serialized shapes for embedders:** `RawInboundToken` now emits
+  `{"source":{"kind":"header","name":"Authorization"}}` instead of
+  `{"source_header":"Authorization"}`. Migrate persisted or wire JSON that
+  reads the old shape. `IdentityPayload.headers` is now `#[serde(skip)]`, so
+  headers no longer appear in serialized payloads or survive a round trip.
+  Out-of-process hosts needing headers must read them from the request.
+  `RawInboundToken`'s `Debug` still redacts the token; `IdentityPayload`'s
+  `Debug` now redacts header values as well.
 
 - **Breaking for the reference audit plugins:** `audit/logger` requires
   `destination:` and `audit/ocsf` requires `destination:` or `exporters:`.
