@@ -4,8 +4,9 @@
 
 The JWT identity plugin originally extracted JWTs only from HTTP headers.
 Issue #64 requested cookie and query parameter support, with one location per
-resolver instance. The former `header` config field is removed; configs can
-use `credential` or omit it to select the default Authorization header.
+resolver instance. The legacy `header` config field remains accepted. New
+configs should use `credential`; omitting both selects the Authorization
+header.
 
 ## Implementation outcome
 
@@ -15,7 +16,8 @@ This document records the original plan. The implemented contract uses
 The cookie and query parsers cap raw input at 16 KiB, reject control
 characters, and reject duplicate configured credential names. The resolver
 reports missing, empty, ambiguous, and malformed inputs with distinct deny
-codes. The sections below retain the planning sketches for historical context;
+codes. The legacy `header` field is accepted unless `credential` is also set.
+The sections below retain the planning sketches for historical context;
 use the API documentation and `docs/content/` for the current interface.
 
 ## Config Format Examples
@@ -263,33 +265,36 @@ After input validation passes:
 
 Both parsers are simple string splits (~20 lines each) plus the two validation guards. No `percent-encoding`, `form_urlencoded`, `cookie`, or `url` crate is needed.
 
-## Phase 3: Plugin Config (breaking change)
+## Phase 3: Plugin Config (original plan; compatibility retained)
 
-### 3a. Config struct changes (breaking — no deprecation)
+### 3a. Config struct changes
 
-In `builtins/plugins/identity-jwt/src/config.rs`, remove the `header: String` field and `default_header()` entirely. Add:
+The original plan removed `header: String` and `default_header()` entirely.
+The implementation retains `header` as a compatibility field and adds:
 
 ```rust
 #[serde(default)]
 pub credential: Option<Credential>,
 ```
 
-The old `header:` key is removed with no alias or deprecation period. All configs must migrate to the `credential` block before upgrading.
+Existing `header:` configs remain valid. New configs should use `credential`.
+Setting both fields on one resolver fails at load.
 
 #### Migration error
 
-Because the config struct uses `#[serde(deny_unknown_fields)]`, an old config containing `header:` will fail deserialization. To replace serde's generic "unknown field" message with an actionable one, add a custom `Deserialize` wrapper (or `deserialize_with`) that detects the `header` key and returns:
+The original plan called for an error on an old config containing `header:`.
+The implemented migration error applies when both fields are set:
 
 ```text
-"the 'header' field was removed; use 'credential: { kind: header, name: Authorization }' instead"
+"configure either `header` or `credential`; migrate `header: NAME` to `credential: { kind: header, name: NAME }`"
 ```
 
-Implementation: a `#[serde(deserialize_with = "deserialize_config")]` function that first attempts normal deserialization, and on failure checks whether the raw map contains a `header` key. If so, it returns the migration error above instead of the generic serde message.
+The resolver checks for both fields after deserialization.
 
 #### Migration guide (changelog entry)
 
 ```markdown
-**Breaking:** The `header` field on `identity/jwt` config is removed.
+**Preferred:** Use the `credential` block on new `identity/jwt` configs.
 Replace:
     header: "Authorization"
 With:
@@ -330,7 +335,11 @@ fn extract_token(
 
 The method takes only `payload` — all three credential sources (headers, `Cookie` header, raw query string) live on `IdentityPayload`. No dependency on `Extensions` or `HttpExtension`.
 
-**`Credential::Header { name }`**: Existing logic — case-insensitive lookup in `payload.headers()`, `Bearer ` prefix strip, `raw_token()` fallback for single-resolver back-compat, empty check. Error code: `auth.malformed_header` (unchanged).
+**`Credential::Header { name }`**: Read the named header case-insensitively
+and strip its Bearer scheme. A host-pre-extracted token is accepted only when
+`source_header` names the configured header; an unattributed pre-extracted token
+remains supported for the default Authorization header. Missing and empty
+values deny as `auth.missing_credential` and `auth.empty_credential`.
 
 **`Credential::Cookie { name }`**:
 1. Case-insensitive lookup for `"cookie"` in `payload.headers()`. If absent → deny `auth.missing_credential` with reason `"no Cookie header in request (resolver '<name>' expects cookie '<cookie_name>')"`.
@@ -372,7 +381,7 @@ Query parameters routinely appear in HTTP access logs, CDN logs, and browser his
 - `RawInboundToken` `Debug` output does not contain the token value
 
 ### Config unit tests (`config.rs`)
-- `credential:` alone → deserializes, neither → default, blank name → error, misspelled key → rejected, old `header:` field → migration-specific error message
+- `credential:` alone → deserializes, neither → default, blank name → error, misspelled key → rejected, old `header:` field → accepted, both fields → migration-specific error message
 
 ### Extraction tests (resolver.rs `#[cfg(test)]`)
 - Header: existing tests, unchanged behavior

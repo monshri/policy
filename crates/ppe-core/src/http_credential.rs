@@ -89,8 +89,6 @@ pub enum CredentialParseError {
     },
 }
 
-/// Decode percent-encoded sequences in `input`, returning `None` if
-/// there are no `%` characters or if the encoding is malformed.
 fn percent_decode_name(input: &str) -> Option<String> {
     if !input.contains('%') {
         return None;
@@ -111,7 +109,6 @@ fn percent_decode_name(input: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Reject oversized or control-character input before parsing.
 fn validate(raw: &str, location: &'static str) -> Result<(), CredentialParseError> {
     if raw.len() > MAX_INPUT_LEN {
         return Err(CredentialParseError::TooLong {
@@ -126,9 +123,6 @@ fn validate(raw: &str, location: &'static str) -> Result<(), CredentialParseErro
     Ok(())
 }
 
-/// Insert `(name, value)` into `map`, rejecting a duplicate only when
-/// `name` matches the configured `credential_name`. Non-credential
-/// duplicates use first-wins (the first value seen stays).
 fn insert_unique(
     map: &mut HashMap<String, String>,
     location: &'static str,
@@ -446,7 +440,7 @@ mod tests {
 
     #[test]
     fn cookie_exactly_at_limit_accepted() {
-        let value = "x".repeat(MAX_INPUT_LEN - 2); // "a=" is 2 bytes
+        let value = "x".repeat(MAX_INPUT_LEN - "a=".len());
         let raw = format!("a={value}");
         assert_eq!(raw.len(), MAX_INPUT_LEN);
         let m = parse_cookie_header(&raw, "_").unwrap();
@@ -455,7 +449,7 @@ mod tests {
 
     #[test]
     fn query_exactly_at_limit_accepted() {
-        let value = "x".repeat(MAX_INPUT_LEN - 2); // "a=" is 2 bytes
+        let value = "x".repeat(MAX_INPUT_LEN - "a=".len());
         let raw = format!("a={value}");
         assert_eq!(raw.len(), MAX_INPUT_LEN);
         let m = parse_query_string(&raw, "_").unwrap();

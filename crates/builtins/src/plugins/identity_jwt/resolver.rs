@@ -216,6 +216,16 @@ impl JwtIdentityResolver {
                 })
             })?;
 
+        if typed.header.is_some() && typed.credential.is_some() {
+            return Err(Box::new(PluginError::Config {
+                message: format!(
+                    "plugin '{}' ({KIND}): configure either `header` or `credential`; \
+                     migrate `header: NAME` to `credential: {{ kind: header, name: NAME }}`",
+                    cfg.name
+                ),
+            }));
+        }
+
         let mut seen_issuers = std::collections::HashSet::new();
         if let Some(dup) = typed
             .trusted_issuers
@@ -400,12 +410,12 @@ impl JwtIdentityResolver {
         let claim_mapper: Arc<dyn ClaimMapper> =
             Arc::new(ConfiguredClaimMap::new(compiled, JWT_MAPPING_PROFILE));
 
-        // `None` (the config omitted `credential:`) defaults to the
-        // `Authorization` header — keeps single-resolver deployments
-        // written before this field existed working unchanged.
-        let credential = typed.credential.unwrap_or_else(|| Credential::Header {
-            name: "Authorization".to_owned(),
-        });
+        let credential = typed
+            .credential
+            .or_else(|| typed.header.map(|name| Credential::Header { name }))
+            .unwrap_or_else(|| Credential::Header {
+                name: "Authorization".to_owned(),
+            });
 
         // Build a CredentialLocation with no prefix — the JWT resolver
         // handles Bearer stripping as a post-extraction normalization
@@ -787,16 +797,19 @@ impl JwtIdentityResolver {
 }
 
 impl JwtIdentityResolver {
-    /// Read the configured credential and report a location-specific denial
-    /// when it cannot be used.
     fn extract_token(
         &self,
         payload: &IdentityPayload,
         ext: &Extensions,
     ) -> Result<(AuthScheme, String), Box<PluginViolation>> {
-        if matches!(self.location.credential, Credential::Header { .. })
+        if let Credential::Header { name } = &self.location.credential
             && payload.headers().is_empty()
             && !payload.raw_token().is_empty()
+            && (payload
+                .source_header()
+                .is_some_and(|source| source.eq_ignore_ascii_case(name))
+                || (payload.source_header().is_none()
+                    && name.eq_ignore_ascii_case("Authorization")))
         {
             return Ok((AuthScheme::PreExtracted, payload.raw_token().to_owned()));
         }
@@ -1780,6 +1793,19 @@ mod tests {
         assert!(err.contains("claim_map"), "{err}");
     }
 
+    #[test]
+    fn new_rejects_legacy_header_alongside_credential() {
+        let err = build_err(json!({
+            "header": "Authorization",
+            "credential": {"kind": "header", "name": "X-User-Token"},
+        }));
+        assert!(
+            err.contains("configure either `header` or `credential`"),
+            "{err}"
+        );
+        assert!(err.contains("migrate `header: NAME`"), "{err}");
+    }
+
     /// An absent setting and the `standard` name are the same thing, and both
     /// have to keep working: an upgrading deployment changes neither.
     /// The claims-bag overrides are a sibling of the two mapper fields, so they
@@ -2144,17 +2170,43 @@ mod tests {
         );
     }
 
-    /// The documented fallback: with no header map populated, a host that
-    /// pre-extracted one token still works. This is the back-compat path.
     #[tokio::test]
-    async fn a_pre_extracted_token_is_used_when_no_header_map_is_populated() {
+    async fn a_pre_extracted_token_is_used_when_its_source_matches_the_header() {
         let resolver = resolver_on_header("X-User-Token");
         let token = jwt_with_payload(r#"{"iss":"https://nobody.example","sub":"alice"}"#);
-        let payload = IdentityPayload::new(token, TokenSource::Bearer);
+        let payload =
+            IdentityPayload::new(token, TokenSource::Bearer).with_source_header("X-User-Token");
         assert_eq!(
             deny_code_for(&resolver, payload).await,
             "auth.untrusted_issuer",
-            "the fallback must supply the token rather than denying on the header"
+            "the named source must supply the token rather than denying on the header"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_header_does_not_use_an_unattributed_pre_extracted_token() {
+        let resolver = resolver_on_header("X-User-Token");
+        let token = jwt_with_payload(r#"{"iss":"https://nobody.example","sub":"alice"}"#);
+        let payload = IdentityPayload::new(token, TokenSource::Bearer);
+
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.missing_credential",
+            "a custom header must have matching source provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_header_rejects_a_different_pre_extracted_source() {
+        let resolver = resolver_on_header("X-User-Token");
+        let token = jwt_with_payload(r#"{"iss":"https://nobody.example","sub":"alice"}"#);
+        let payload =
+            IdentityPayload::new(token, TokenSource::Bearer).with_source_header("Authorization");
+
+        assert_eq!(
+            deny_code_for(&resolver, payload).await,
+            "auth.missing_credential",
+            "a different source header must not satisfy the configured header"
         );
     }
 
@@ -2330,7 +2382,6 @@ mod tests {
         );
     }
 
-    /// A resolver configured to read its token from a cookie of the given name.
     fn resolver_on_cookie(name: &str) -> JwtIdentityResolver {
         let cfg = cfg_with_config(
             "jwt",
@@ -2348,8 +2399,6 @@ mod tests {
         JwtIdentityResolver::new(cfg).expect("a valid resolver config")
     }
 
-    /// A resolver configured to read its token from a query parameter of the
-    /// given name.
     fn resolver_on_query_param(name: &str) -> JwtIdentityResolver {
         let cfg = cfg_with_config(
             "jwt",

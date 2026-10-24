@@ -28,11 +28,6 @@ ignore = [
     # aws-lc backend, not the pure-Rust backend that would pull `rsa` into the
     # shipped tree, so it never reaches consumers.
     "RUSTSEC-2023-0071",
-    # --- tokio AsyncFd I/O safety unsoundness, no patched release ---
-    # AsyncFd::new accepts any RawFd without ownership proof. This crate
-    # does not use AsyncFd; tokio is a transitive runtime dependency.
-    # No fixed tokio version is available yet.
-    "RUSTSEC-2026-0386",
 ]
 
 [licenses]

@@ -152,7 +152,7 @@ credential:
   name: access_token
 ```
 
-Omitting `credential:` entirely defaults to
+Omitting both `credential:` and `header:` defaults to
 `{ kind: header, name: Authorization }`.
 
 > **Security: query-parameter credentials and logging.** A token in a
@@ -163,12 +163,11 @@ Omitting `credential:` entirely defaults to
 > startup so the operator can scrub query strings from their own
 > logging pipeline.
 
-> **Migration from `header:`.** The previous `header:` config key is
-> removed. A config still writing `header: "Authorization"` fails the
-> load as an unrecognized field. Replace it with
-> `credential: { kind: header, name: Authorization }`. A config that
-> never set `header:` needs no change — the default remains the
-> `Authorization` header.
+> **Migration from `header:`.** Existing `header: "Authorization"`
+> settings remain supported. For new configurations, use
+> `credential: { kind: header, name: Authorization }`. Setting both
+> `header:` and `credential:` on one resolver fails at load. A config
+> that sets neither uses the `Authorization` header.
 
 ## Global
 

@@ -1166,14 +1166,24 @@ async fn query_param_credential_resolves_identity() {
 
 mod query_identity_and_policy {
     use super::*;
-    use praxis_policy_core::extensions::HttpExtension;
+    use praxis_policy_core::cmf::constants::{ENTITY_HTTP, ENTITY_NAME_GLOBAL};
+    use praxis_policy_core::extensions::{HttpExtension, MetaExtension};
+    use praxis_policy_core::http_hook::{HOOK_HTTP_REQUEST, HttpHook, HttpPayload};
 
     fn query_ext(query: Option<String>) -> Extensions {
+        let meta = MetaExtension {
+            entity_type: Some(ENTITY_HTTP.to_owned()),
+            entity_name: Some(ENTITY_NAME_GLOBAL.to_owned()),
+            ..Default::default()
+        };
         Extensions {
             http: Some(std::sync::Arc::new(HttpExtension {
+                method: Some("GET".to_owned()),
+                path: Some("/query-auth".to_owned()),
                 query,
                 ..Default::default()
             })),
+            meta: Some(std::sync::Arc::new(meta)),
             ..Default::default()
         }
     }
@@ -1187,7 +1197,7 @@ mod query_identity_and_policy {
         let token = hs256_token(&standard_claims());
         let qs = format!("access_token={token}&format=json");
         let payload = IdentityPayload::new(String::new(), TokenSource::Bearer);
-        let ext = query_ext(Some(qs.clone()));
+        let ext = query_ext(Some(qs));
         let (result, _bg) = engine
             .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, ext, None)
             .await;
@@ -1197,7 +1207,11 @@ mod query_identity_and_policy {
         let subject = identity.subject.as_ref().expect("a user subject");
         assert_eq!(subject.id.as_deref(), Some("cookie-user"));
 
-        let policy_ext = identity.apply_to_extensions(query_ext(Some(qs)));
+        let pipeline_ext = result
+            .modified_extensions
+            .clone()
+            .expect("identity result carries the request extensions");
+        let policy_ext = identity.apply_to_extensions(pipeline_ext);
         let http = policy_ext
             .http
             .as_ref()
@@ -1254,7 +1268,7 @@ mod query_identity_and_policy {
         let token = hs256_token(&standard_claims());
         let qs = format!("page=2&access_token={token}&limit=50");
         let payload = IdentityPayload::new(String::new(), TokenSource::Bearer);
-        let ext = query_ext(Some(qs.clone()));
+        let ext = query_ext(Some(qs));
         let (result, _bg) = engine
             .invoke_named::<IdentityHook>(HOOK_IDENTITY_RESOLVE, payload, ext, None)
             .await;
@@ -1263,10 +1277,71 @@ mod query_identity_and_policy {
         let identity = IdentityPayload::from_pipeline_result(&result).expect("resolved identity");
         assert!(identity.subject.is_some());
 
-        let policy_ext = identity.apply_to_extensions(query_ext(Some(qs)));
+        let pipeline_ext = result
+            .modified_extensions
+            .clone()
+            .expect("identity result carries the request extensions");
+        let policy_ext = identity.apply_to_extensions(pipeline_ext);
         let http = policy_ext.http.as_ref().expect("http present");
         assert!(http.query.as_ref().is_some_and(|q| q.contains("page=2")));
         assert!(http.query.as_ref().is_some_and(|q| q.contains("limit=50")));
+    }
+
+    #[tokio::test]
+    async fn policy_reads_the_query_carried_through_identity_resolution() {
+        let identity_engine = host::engine(Vec::new());
+        identity_engine
+            .load_config_yaml(QUERY_PARAM_CONFIG)
+            .expect("load identity config");
+        identity_engine
+            .initialize()
+            .await
+            .expect("initialize identity");
+
+        let token = hs256_token(&standard_claims());
+        let matching_query = format!("access_token={token}&format=json");
+        let policy_engine = host::engine(Vec::new());
+        policy_engine
+            .load_config_yaml(&format!(
+                "engine_settings:\n  dispatch: policy\nroutes:\n  - http:\n      path: /query-auth\n    authorization:\n      pre_invocation:\n        - \"http.query == '{matching_query}': deny\"\n"
+            ))
+            .expect("load query policy");
+        policy_engine.initialize().await.expect("initialize policy");
+
+        for (query, should_deny) in [
+            (matching_query, true),
+            (format!("access_token={token}&format=xml"), false),
+        ] {
+            let payload = IdentityPayload::new(String::new(), TokenSource::Bearer);
+            let (identity_result, _bg) = identity_engine
+                .invoke_named::<IdentityHook>(
+                    HOOK_IDENTITY_RESOLVE,
+                    payload,
+                    query_ext(Some(query)),
+                    None,
+                )
+                .await;
+            assert!(
+                identity_result.continue_processing,
+                "identity denied: {:?}",
+                identity_result.violation
+            );
+            let identity =
+                IdentityPayload::from_pipeline_result(&identity_result).expect("resolved identity");
+            let pipeline_ext = identity_result
+                .modified_extensions
+                .expect("identity result carries the request extensions");
+            let policy_ext = identity.apply_to_extensions(pipeline_ext);
+            let (policy_result, _bg) = policy_engine
+                .invoke_named::<HttpHook>(HOOK_HTTP_REQUEST, HttpPayload, policy_ext, None)
+                .await;
+            assert_eq!(
+                !policy_result.continue_processing,
+                should_deny,
+                "http.query predicate selected the wrong outcome; code: {:?}",
+                policy_result.violation.as_ref().map(|v| v.code.as_str())
+            );
+        }
     }
 
     #[tokio::test]

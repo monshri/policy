@@ -35,8 +35,8 @@ use praxis_policy_core::identity::mapping::ClaimMapConfig;
 /// silently: `claim_maps` would leave the resolver on the standard preset while
 /// the operator believed their map was live.
 ///
-/// The former `header` field is no longer accepted. Use `credential` to
-/// select a header, cookie, or query parameter.
+/// The legacy `header` field remains accepted for existing configurations.
+/// New configurations should use `credential`; setting both is an error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JwtIdentityResolverConfig {
@@ -63,11 +63,15 @@ pub struct JwtIdentityResolverConfig {
     /// forwarding plugins can re-attach (or strip) the credential at
     /// the same location.
     ///
-    /// `None` defaults to `Header { name: "Authorization" }`, which
-    /// matches the most common case and keeps single-resolver
-    /// deployments backwards-compatible.
+    /// `None` uses the legacy `header` field when present, or the
+    /// `Authorization` header otherwise.
     #[serde(default)]
     pub credential: Option<Credential>,
+
+    /// Legacy header name. Use `credential: { kind: header, name: ... }`
+    /// for new configurations. Cannot be set alongside `credential`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
 
     /// Which shipped preset to map claims with: `standard`, `keycloak`,
     /// `auth0` or `cognito`. Omitted resolves to `standard`, which reproduces
@@ -1205,20 +1209,14 @@ mod tests {
     }
 
     #[test]
-    fn old_header_field_is_rejected_as_an_unknown_field() {
-        // `header:` is removed with no back-compat alias. No hand-authored
-        // migration message yet (see the struct doc comment) — this pins
-        // today's behavior, which is `deny_unknown_fields`'s generic error
-        // naming `header` as unrecognized.
+    fn legacy_header_field_deserializes() {
         let raw = json!({
             "trusted_issuers": [minimal_issuer()],
-            "header": "Authorization",
+            "header": "X-User-Token",
         });
-        let err = serde_json::from_value::<JwtIdentityResolverConfig>(raw).unwrap_err();
-        assert!(
-            err.to_string().contains("header"),
-            "error should name the unknown field: {err}"
-        );
+        let cfg: JwtIdentityResolverConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cfg.header.as_deref(), Some("X-User-Token"));
+        assert_eq!(cfg.credential, None);
     }
 
     #[test]

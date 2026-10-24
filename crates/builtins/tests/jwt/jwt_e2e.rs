@@ -64,7 +64,16 @@ async fn invoke_bearer(token: String) -> praxis_policy_core::executor::PipelineR
     invoke(resolver_plugin_config(), token, TokenSource::Bearer).await
 }
 
-/// A resolver reading its token from the given cookie name.
+async fn invoke_workload(token: String) -> praxis_policy_core::executor::PipelineResult {
+    let payload = IdentityPayload::new(token, TokenSource::SpiffeJwtSvid)
+        .with_source_header("X-Workload-Token");
+    invoke_with_payload(
+        resolver_plugin_config_for("workload", "X-Workload-Token"),
+        payload,
+    )
+    .await
+}
+
 fn resolver_plugin_config_for_cookie(name: &str) -> PluginConfig {
     plugin_config(json!({
         "claim_mapper": "standard",
@@ -72,10 +81,6 @@ fn resolver_plugin_config_for_cookie(name: &str) -> PluginConfig {
     }))
 }
 
-/// A resolver reading its token from the given query parameter name.
-///
-/// Includes `read_query` so the capability filter passes
-/// `HttpExtension.query` through to the handler.
 fn resolver_plugin_config_for_query_param(name: &str) -> PluginConfig {
     let mut cfg = plugin_config(json!({
         "claim_mapper": "standard",
@@ -89,8 +94,6 @@ fn resolver_plugin_config_for_query_param(name: &str) -> PluginConfig {
 // Tests
 // -----------------------------------------------------------------------------
 
-/// Happy path: valid signed token resolves to a populated subject,
-/// raw token lands in `raw_credentials.inbound_tokens[User]`.
 #[tokio::test]
 async fn valid_jwt_resolves_subject() {
     let token = mint_jwt(json!({
@@ -279,12 +282,7 @@ async fn workload_svid_resolves_caller_workload_and_stashes_as_spiffe_jwt() {
         "iat": now_unix(),
     }));
 
-    let result = invoke(
-        resolver_plugin_config_for("workload", "X-Workload-Token"),
-        svid.clone(),
-        TokenSource::SpiffeJwtSvid,
-    )
-    .await;
+    let result = invoke_workload(svid.clone()).await;
     assert!(
         result.continue_processing,
         "valid SVID should resolve: violation = {:?}",
@@ -330,27 +328,17 @@ async fn workload_svid_resolves_caller_workload_and_stashes_as_spiffe_jwt() {
     );
 }
 
-/// A `role: workload` resolver handed a perfectly valid *user* JWT
-/// must refuse it rather than filing a non-SPIFFE identity into the
-/// workload slot. Guards the boundary that makes `subject: workload`
-/// meaningful: whatever is in that slot really is an attested
-/// workload.
 #[tokio::test]
 async fn workload_role_rejects_a_non_spiffe_token() {
     let user_jwt = mint_jwt(json!({
-        "sub": "alice@corp.com",  // no spiffe:// prefix
+        "sub": "alice@corp.com",
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
         "exp": now_unix() + 300,
         "iat": now_unix(),
     }));
 
-    let result = invoke(
-        resolver_plugin_config_for("workload", "X-Workload-Token"),
-        user_jwt,
-        TokenSource::SpiffeJwtSvid,
-    )
-    .await;
+    let result = invoke_workload(user_jwt).await;
 
     assert!(
         !result.continue_processing,
@@ -360,27 +348,18 @@ async fn workload_role_rejects_a_non_spiffe_token() {
     assert_eq!(violation.code, "auth.mapping_failed");
 }
 
-/// The `spiffe_id` fallback must be prefix-checked too: a non-SPIFFE
-/// `sub` combined with an arbitrary `spiffe_id` claim must NOT be
-/// accepted as a workload. Without the guard on the fallback, this token
-/// would be mislabeled `TokenKind::SpiffeJwt` and land in `caller_workload`.
 #[tokio::test]
 async fn workload_role_rejects_non_spiffe_sub_with_bogus_spiffe_id_claim() {
     let jwt = mint_jwt(json!({
-        "sub": "alice@corp.com",          // not a SPIFFE ID
-        "spiffe_id": "not-a-spiffe-id",   // arbitrary, non-SPIFFE fallback
+        "sub": "alice@corp.com",
+        "spiffe_id": "not-a-spiffe-id",
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
         "exp": now_unix() + 300,
         "iat": now_unix(),
     }));
 
-    let result = invoke(
-        resolver_plugin_config_for("workload", "X-Workload-Token"),
-        jwt,
-        TokenSource::SpiffeJwtSvid,
-    )
-    .await;
+    let result = invoke_workload(jwt).await;
 
     assert!(
         !result.continue_processing,
@@ -392,26 +371,18 @@ async fn workload_role_rejects_non_spiffe_sub_with_bogus_spiffe_id_claim() {
     );
 }
 
-/// The legit fallback still resolves: when `sub` isn't a SPIFFE ID but a
-/// valid `spiffe://` lives in the `spiffe_id` claim, the workload is
-/// accepted. Guards the fix from over-restricting.
 #[tokio::test]
 async fn workload_role_accepts_valid_spiffe_id_claim_fallback() {
     let jwt = mint_jwt(json!({
-        "sub": "svc-account-123",                                 // not SPIFFE
-        "spiffe_id": "spiffe://corp.example/ns/default/sa/agent", // valid SPIFFE fallback
+        "sub": "svc-account-123",
+        "spiffe_id": "spiffe://corp.example/ns/default/sa/agent",
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
         "exp": now_unix() + 300,
         "iat": now_unix(),
     }));
 
-    let result = invoke(
-        resolver_plugin_config_for("workload", "X-Workload-Token"),
-        jwt,
-        TokenSource::SpiffeJwtSvid,
-    )
-    .await;
+    let result = invoke_workload(jwt).await;
 
     assert!(
         result.continue_processing,
@@ -419,9 +390,6 @@ async fn workload_role_accepts_valid_spiffe_id_claim_fallback() {
     );
 }
 
-/// Token correctly signed by the test key but its `iss` doesn't
-/// match any trusted issuer in our config → `auth.untrusted_issuer`.
-/// This is the path where the peek-at-iss step does its job.
 #[tokio::test]
 async fn untrusted_issuer_rejects() {
     let token = mint_jwt(json!({
@@ -437,8 +405,6 @@ async fn untrusted_issuer_rejects() {
     assert_eq!(v.code, "auth.untrusted_issuer");
 }
 
-/// `exp` claim is one hour in the past → `auth.token_expired`.
-/// Leeway is 60s so a 1h-stale token is unambiguously rejected.
 #[tokio::test]
 async fn expired_token_rejects() {
     let token = mint_jwt(json!({
@@ -454,7 +420,6 @@ async fn expired_token_rejects() {
     assert_eq!(v.code, "auth.token_expired");
 }
 
-/// `aud` doesn't match the configured audience → `auth.audience_mismatch`.
 #[tokio::test]
 async fn wrong_audience_rejects() {
     let token = mint_jwt(json!({
@@ -470,10 +435,6 @@ async fn wrong_audience_rejects() {
     assert_eq!(v.code, "auth.audience_mismatch");
 }
 
-/// Tamper with the signature bytes → signature verification fails →
-/// `auth.signature_invalid`. The load-bearing test for the security
-/// story; if this passes, the cryptographic validation is wired
-/// correctly through the whole pipeline.
 #[tokio::test]
 async fn tampered_signature_rejects() {
     let valid = mint_jwt(json!({
@@ -588,6 +549,45 @@ async fn custom_header_extracts_from_headers_map() {
         Credential::Header {
             name: "X-User-Token".into()
         }
+    );
+}
+
+#[tokio::test]
+async fn legacy_header_config_resolves_named_header() {
+    let token = mint_jwt(json!({
+        "sub": "alice@corp.com",
+        "iss": TEST_ISSUER,
+        "aud": TEST_AUDIENCE,
+        "exp": now_unix() + 300,
+        "iat": now_unix(),
+    }));
+    let headers = HashMap::from([("x-user-token".to_owned(), format!("Bearer {token}"))]);
+    let payload = IdentityPayload::new("", TokenSource::Bearer).with_headers(headers);
+    let config = plugin_config(json!({ "header": "X-User-Token" }));
+
+    let result = invoke_with_payload(config, payload).await;
+    assert!(
+        result.continue_processing,
+        "legacy header config denied: {:?}",
+        result.violation
+    );
+    let identity = IdentityPayload::from_pipeline_result(&result).expect("resolved identity");
+    assert_eq!(
+        identity
+            .subject
+            .as_ref()
+            .and_then(|subject| subject.id.as_deref()),
+        Some("alice@corp.com")
+    );
+    assert_eq!(
+        identity
+            .raw_credentials
+            .as_ref()
+            .and_then(|raw| raw.inbound_tokens.get(&TokenRole::User))
+            .map(|raw| &raw.source),
+        Some(&Credential::Header {
+            name: "X-User-Token".to_owned()
+        })
     );
 }
 

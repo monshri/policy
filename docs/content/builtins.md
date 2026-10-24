@@ -152,6 +152,9 @@ kinds are supported:
 | `cookie` | Browser apps that deliver the JWT in an HttpOnly cookie | `__Host-jwt`, `session` |
 | `query_param` | Endpoints where the client cannot set headers (WebSocket, SSE) | `access_token` |
 
+Query parameter credentials require the `read_query` capability. Granting
+`read_headers` alone does not expose the raw query string to a plugin.
+
 ```yaml
 # Cookie-based JWT
 plugins:
@@ -178,7 +181,7 @@ plugins:
   - name: jwt-ws
     kind: identity/jwt
     hooks: [identity.resolve]
-    capabilities: [perform_http]
+    capabilities: [perform_http, read_query]
     config:
       role: user
       credential:
@@ -192,8 +195,11 @@ plugins:
             url: "https://idp.example.com/.well-known/jwks.json"
 ```
 
-Omitting `credential:` defaults to
+Omitting both `credential:` and `header:` defaults to
 `{ kind: header, name: Authorization }`.
+The legacy `header: NAME` setting still works; migrate it to
+`credential: { kind: header, name: NAME }` when updating the policy.
+Setting both fields on one resolver is a configuration error.
 
 An issuer with DPoP enabled requires a header credential and the
 `read_headers` capability. A cookie or query parameter credential fails

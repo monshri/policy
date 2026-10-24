@@ -79,10 +79,11 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   the same credential regardless of which proxy sits in front of it. DPoP
   requires a header credential; cookie and query parameter locations are
   refused at load when an issuer enables DPoP.
-  **Breaking for existing config** — `header:` is removed with no alias:
+  The legacy `header:` setting remains supported. New configurations should
+  use `credential:`; the two settings cannot be combined:
 
   ```yaml
-  # Before
+  # Legacy (still supported)
   plugins:
     - name: user-jwt
       kind: identity/jwt
@@ -90,7 +91,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
         header: "Authorization"
         trusted_issuers: [...]
 
-  # After
+  # Preferred
   plugins:
     - name: user-jwt
       kind: identity/jwt
@@ -101,8 +102,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
         trusted_issuers: [...]
   ```
 
-  Omitting `credential:` entirely still defaults to the `Authorization` header,
-  so a config that never set `header:` needs no change.
+  Omitting both settings defaults to the `Authorization` header.
 
   Runtime deny codes for credential extraction: `auth.missing_credential` (no
   `Cookie` header or query string supplied), `auth.empty_credential` (name
@@ -119,6 +119,28 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   ([#64](https://github.com/praxis-proxy/policy/issues/64))
 
 ### Changed
+
+- **Breaking for embedders**: `RawInboundToken.source_header: String` is
+  replaced by `RawInboundToken.source: Credential`, and its constructor becomes
+  `RawInboundToken::new(token, source: Credential, kind)`. The serialized JSON
+  shape changes from `{"source_header":"Authorization"}` to
+  `{"source":{"kind":"header","name":"Authorization"}}` — the value is now a
+  `Credential` object, not a plain string, so persisted or wire JSON using the
+  old shape must be migrated. `Credential` (in
+  `praxis_policy_core::extensions`) is the new shared type recording where any
+  identity plugin — this one, or a future X.509/mTLS or WIMSE Proof Token
+  resolver — extracted a credential from, so downstream consumers (audit
+  logging, assertion propagation, policy predicates) read one uniform type
+  regardless of which plugin produced it. `RawInboundToken`'s `Debug`
+  continues to redact the token.
+
+  `IdentityPayload.headers` is now `#[serde(skip)]` — the field is no longer
+  included in serialized output. Previously it was `skip_serializing_if =
+  "HashMap::is_empty"`, which could include request headers in serialized
+  payloads when non-empty. Headers may carry credentials and must not appear
+  in serialized output. Out-of-process hosts that relied on receiving headers
+  through serialized `IdentityPayload` should read them from the input request
+  directly.
 
 - **Breaking for the reference audit plugins:** `audit/logger` requires
   `destination:` and `audit/ocsf` requires `destination:` or `exporters:`.
@@ -159,33 +181,6 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   exhaustive matches need a new arm. `Extensions.metadata` is never
   serialized. The new metadata enums are `#[non_exhaustive]`.
 
-### Removed
-
-- **The `identity/jwt` plugin's `header:` config field.** Replaced by the
-  `credential:` block (see Added). A config still writing `header:` fails
-  the load as the unrecognized field it now is.
-
-  **Breaking for embedders**: `RawInboundToken.source_header: String` is
-  replaced by `RawInboundToken.source: Credential`, and its constructor becomes
-  `RawInboundToken::new(token, source: Credential, kind)`. The serialized JSON
-  shape changes from `{"source_header":"Authorization"}` to
-  `{"source":{"kind":"header","name":"Authorization"}}` — the value is now a
-  `Credential` object, not a plain string, so persisted or wire JSON using the
-  old shape must be migrated. `Credential` (in
-  `praxis_policy_core::extensions`) is the new shared type recording where any
-  identity plugin — this one, or a future X.509/mTLS or WIMSE Proof Token
-  resolver — extracted a credential from, so downstream consumers (audit
-  logging, assertion propagation, policy predicates) read one uniform type
-  regardless of which plugin produced it. `RawInboundToken`'s `Debug`
-  continues to redact the token.
-
-  `IdentityPayload.headers` is now `#[serde(skip)]` — the field is no longer
-  included in serialized output. Previously it was `skip_serializing_if =
-  "HashMap::is_empty"`, which could include request headers in serialized
-  payloads when non-empty. Headers may carry credentials and must not appear
-  in serialized output. Out-of-process hosts that relied on receiving headers
-  through serialized `IdentityPayload` should read them from the input request
-  directly.
 
 ## [0.5.0] - 2026-10-13
 

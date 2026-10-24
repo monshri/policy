@@ -393,7 +393,6 @@ async fn a_mistyped_path_is_permissive_by_default_and_fatal_on_request() {
 async fn the_workload_role_requires_a_spiffe_id_on_whichever_candidate_resolves() {
     let map = json!({
         "role": "workload",
-        "credential": { "kind": "header", "name": "X-Workload-Token" },
         "claim_map": {"workload": {"spiffe_id": ["sub", "spiffe_id"]}},
     });
 
